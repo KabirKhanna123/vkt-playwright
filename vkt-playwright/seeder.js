@@ -63,31 +63,49 @@ async function seedPerformer(page, performer) {
   let seeded = 0;
 
   try {
-    await page.goto(performer.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
+    await page.goto(performer.url, { waitUntil: 'networkidle', timeout: 45000 });
+    await page.waitForTimeout(4000);
 
     // Dismiss any modal
     try {
-      const btn = page.locator('button:has-text("Continue"), button:has-text("Close")').first();
+      const btn = page.locator('button:has-text("Continue"), button:has-text("Close"), button:has-text("Accept")').first();
       if (await btn.isVisible({ timeout: 2000 })) await btn.click();
+      await page.waitForTimeout(500);
     } catch(e) {}
 
-    // Find all event links on the performer page
+    // Scroll down to trigger lazy loading
+    await page.evaluate(async () => {
+      for (let i = 0; i < 5; i++) {
+        window.scrollBy(0, 600);
+        await new Promise(r => setTimeout(r, 800));
+      }
+    });
+    await page.waitForTimeout(2000);
+
+    // Try to find event links - StubHub uses multiple patterns
     const eventLinks = await page.evaluate(() => {
       const links = [];
       const seen = new Set();
+
+      // Pattern 1: direct /event/ links
       document.querySelectorAll('a[href*="/event/"]').forEach(a => {
-        const href = a.href;
-        const m = href.match(/\/event\/(\d{5,})/);
+        const m = (a.href || '').match(/\/event\/(\d{5,})/);
         if (m && !seen.has(m[1])) {
           seen.add(m[1]);
-          // Get event name and date from nearby elements
-          const container = a.closest('[data-testid], li, article, div[class*="event"], div[class*="listing"]') || a.parentElement;
-          const text = container ? container.innerText.trim().slice(0, 200) : '';
-          links.push({ id: m[1], url: href, text });
+          links.push({ id: m[1], url: a.href });
         }
       });
-      return links.slice(0, 50); // max 50 events per performer
+
+      // Pattern 2: links with event ID in path
+      document.querySelectorAll('a[href*="stubhub.com"]').forEach(a => {
+        const m = (a.href || '').match(/\/(\d{8,})\//);
+        if (m && !seen.has(m[1])) {
+          seen.add(m[1]);
+          links.push({ id: m[1], url: a.href });
+        }
+      });
+
+      return links.slice(0, 80);
     });
 
     console.log(`  Found ${eventLinks.length} events`);

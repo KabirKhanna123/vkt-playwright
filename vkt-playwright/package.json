@@ -1,0 +1,16 @@
+{
+  "name": "vkt-playwright-scraper",
+  "version": "1.0.0",
+  "description": "StubHub scraper for VKT Market Data",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "playwright": "^1.42.0",
+    "@supabase/supabase-js": "^2.39.0"
+  }
+}

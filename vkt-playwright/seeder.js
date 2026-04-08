@@ -82,6 +82,16 @@ async function seedPerformer(page, performer) {
     });
     await page.waitForTimeout(2000);
 
+    // Debug: log page title and URL to see what StubHub returned
+    const pageTitle = await page.title();
+    const pageUrl = await page.url();
+    console.log(`  Page: ${pageTitle} | ${pageUrl}`);
+
+    // Check for bot detection
+    const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 300));
+    console.log(`  Body preview: ${bodyText.replace(/
+/g, ' ')}`);
+
     // Try to find event links - StubHub uses multiple patterns
     const eventLinks = await page.evaluate(() => {
       const links = [];
@@ -96,7 +106,7 @@ async function seedPerformer(page, performer) {
         }
       });
 
-      // Pattern 2: links with event ID in path
+      // Pattern 2: links with event ID in path  
       document.querySelectorAll('a[href*="stubhub.com"]').forEach(a => {
         const m = (a.href || '').match(/\/(\d{8,})\//);
         if (m && !seen.has(m[1])) {
@@ -104,6 +114,21 @@ async function seedPerformer(page, performer) {
           links.push({ id: m[1], url: a.href });
         }
       });
+
+      // Pattern 3: check __NEXT_DATA__ for event IDs
+      try {
+        const nd = document.getElementById('__NEXT_DATA__');
+        if (nd) {
+          const data = JSON.stringify(JSON.parse(nd.textContent));
+          const matches = [...data.matchAll(/"id":"(\d{6,})"/g)];
+          matches.forEach(m => {
+            if (!seen.has(m[1])) {
+              seen.add(m[1]);
+              links.push({ id: m[1], url: 'https://www.stubhub.com/event/' + m[1] });
+            }
+          });
+        }
+      } catch(e) {}
 
       return links.slice(0, 80);
     });

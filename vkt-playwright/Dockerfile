@@ -2,10 +2,10 @@ FROM mcr.microsoft.com/playwright:v1.42.0-jammy
 
 WORKDIR /app
 
-COPY package.json ./
+COPY vkt-playwright/package.json ./
 RUN npm install
 RUN npx playwright install chromium
 
-COPY scraper.js ./
+COPY vkt-playwright/scraper.js ./
 
 CMD ["node", "scraper.js"]

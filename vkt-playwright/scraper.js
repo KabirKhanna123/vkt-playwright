@@ -8,6 +8,7 @@ const DECODO_TOKEN = process.env.DECODO_TOKEN || 'VTAwMDAzODg2OTg6UFdfMWQxMWYxY2
 const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '5000', 10);
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
 const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
+const MIN_HTML_LENGTH = 100000;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -77,7 +78,7 @@ async function fetchWithDecodo(url) {
     }
     const data = await response.json();
     const html = data?.results?.[0]?.content || data?.content || data?.html || null;
-    console.log('  HTML length:', html ? html.length : 0);
+    if (html) console.log('  HTML length:', html.length);
     return html;
   } catch(e) {
     console.error('  Decodo fetch error:', e.message);
@@ -92,14 +93,12 @@ function extractFromHtml(html) {
 
   // --- JSON-LD ---
   const jsonLdMatches = [...html.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
-  console.log('  JSON-LD blocks found:', jsonLdMatches.length);
   for (const match of jsonLdMatches) {
     try {
       const parsed = JSON.parse(match[1]);
       const items = Array.isArray(parsed) ? parsed : [parsed];
       for (const item of items) {
         if (!item || typeof item !== 'object') continue;
-        console.log('  JSON-LD @type:', item['@type']);
         if (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent') continue;
         if (!name && item.name && !item.name.toLowerCase().includes('tickets')) name = item.name;
         if (!date && item.startDate) date = normalizeDateString(item.startDate);
@@ -108,15 +107,15 @@ function extractFromHtml(html) {
           const state = item.location.address?.addressRegion || '';
           venue = [item.location.name, city, state].filter(Boolean).join(', ');
         }
-        console.log('  JSON-LD extracted -> name:', name, 'date:', date, 'venue:', venue);
+        if (name && date && venue) break;
       }
-    } catch(e) { console.log('  JSON-LD parse error:', e.message); }
+    } catch(_) {}
+    if (name && date && venue) break;
   }
 
   // --- __NEXT_DATA__ ---
   if (!name || !date || !venue) {
     const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
-    console.log('  __NEXT_DATA__ found:', !!nextMatch);
     if (nextMatch) {
       try {
         const parsed = JSON.parse(nextMatch[1]);
@@ -136,34 +135,40 @@ function extractFromHtml(html) {
           for (const k of Object.keys(obj)) { if (obj[k] && typeof obj[k] === 'object') walk(obj[k]); }
         }
         walk(parsed);
-        console.log('  NEXT_DATA extracted -> name:', name, 'date:', date, 'venue:', venue);
-      } catch(e) { console.log('  NEXT_DATA parse error:', e.message); }
+      } catch(_) {}
     }
   }
 
   // --- app-context fallback ---
   if (!date || !venue) {
     const appCtxMatch = html.match(/<script id="app-context"[^>]*>([\s\S]*?)<\/script>/i);
-    console.log('  app-context found:', !!appCtxMatch);
     if (appCtxMatch) {
       try {
         const ctx = JSON.parse(appCtxMatch[1]);
         if (!date && ctx.eventDate) date = normalizeDateString(ctx.eventDate);
         if (!venue && ctx.venueName) venue = ctx.venueName;
         if (!venue && ctx.venueConfigName) venue = ctx.venueConfigName;
-        console.log('  app-context extracted -> date:', date, 'venue:', venue);
-      } catch(e) { console.log('  app-context parse error:', e.message); }
+      } catch(_) {}
     }
   }
 
-  // --- Raw regex fallbacks for date/venue ---
+  // --- Raw regex fallbacks ---
   if (!date) {
     const dateMatch = html.match(/"startDate"\s*:\s*"([^"]+)"/);
-    if (dateMatch) { date = normalizeDateString(dateMatch[1]); console.log('  Raw date match:', date); }
+    if (dateMatch) date = normalizeDateString(dateMatch[1]);
   }
   if (!venue) {
     const venueMatch = html.match(/"venueName"\s*:\s*"([^"]+)"/);
-    if (venueMatch) { venue = venueMatch[1]; console.log('  Raw venue match:', venue); }
+    if (venueMatch) venue = venueMatch[1];
+  }
+
+  // --- Title fallback for name ---
+  if (!name) {
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+    if (titleMatch) {
+      let t = titleMatch[1].replace(/\s*tickets\s*[-–|].*$/i, '').replace(/\s*[-–|].*$/i, '').trim();
+      if (t && !t.toLowerCase().includes('tickets')) name = t;
+    }
   }
 
   // --- Listing count ---
@@ -190,18 +195,7 @@ function extractFromHtml(html) {
     if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
   }
 
-  // --- Title fallback for name ---
-  if (!name) {
-    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-    if (titleMatch) {
-      let t = titleMatch[1].replace(/\s*tickets\s*[-–|].*$/i, '').replace(/\s*[-–|].*$/i, '').trim();
-      if (t && !t.toLowerCase().includes('tickets')) name = t;
-    }
-  }
-
   prices.sort((a,b)=>a-b);
-  console.log('  Final: name='+name+' date='+date+' venue='+venue);
-  console.log('  Parsed: listings='+totalListings+', prices='+prices.length+(prices.length ? ', floor=$'+Math.round(prices[0]) : ''));
   return { name, date, venue, totalListings, prices };
 }
 
@@ -211,9 +205,14 @@ async function scrapeEvent(event) {
 
   try {
     const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
-    console.log('  Fetching:', url);
     const html = await fetchWithDecodo(url);
     if (!html) { console.error('  No HTML for', eventId); return null; }
+
+    // Skip bot-challenge pages (too small to be real)
+    if (html.length < MIN_HTML_LENGTH) {
+      console.log('  Skipping '+eventId+' — HTML too small ('+html.length+'), likely bot challenge');
+      return null;
+    }
 
     const { name: parsedName, date: parsedDate, venue: parsedVenue, totalListings, prices } = extractFromHtml(html);
 
@@ -225,7 +224,8 @@ async function scrapeEvent(event) {
     const summary = summarizePrices(prices);
     if (!summary.floor) { console.log('  No pricing for '+name); return null; }
 
-    console.log('  Posting snapshot: name='+name+' date='+date+' venue='+venue);
+    console.log('  '+name+' | '+date+' | '+venue);
+    console.log('  '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg);
 
     await postSnapshot({
       eventId, eventName:name, eventDate:date, venue, platform:'StubHub',

@@ -1,13 +1,11 @@
-const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
 const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
-const DECODO_TOKEN = process.env.DECODO_TOKEN || 'VTAwMDAzODg2OTg6UFdfMWQxMWYxY2ZlNTZhNW';
+const DECODO_TOKEN = process.env.DECODO_TOKEN || 'VTAwMDAzODg2OTg6UFdfMWQxMWYxY2ZlNTZhNWY2MzQ1YWVkMjUzZGUzNjI4MjA3';
 
 const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '5000', 10);
-const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '2500', 10);
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
 const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 
@@ -55,9 +53,9 @@ async function postSnapshot(payload) {
   } catch(e) { console.error('Snapshot error:', e.message); return false; }
 }
 
-// Fetch HTML via Decodo Web Scraping API (no proxy tunnel needed)
 async function fetchWithDecodo(url) {
   try {
+    console.log('  Decodo fetching:', url);
     const response = await fetch('https://scraper-api.decodo.com/v2/scrape', {
       method: 'POST',
       headers: {
@@ -74,23 +72,18 @@ async function fetchWithDecodo(url) {
     });
     if (!response.ok) {
       const errText = await response.text();
-      console.error('Decodo API error:', response.status, errText);
+      console.error('  Decodo API error:', response.status, errText);
       return null;
     }
     const data = await response.json();
-    // Decodo returns { results: [{ content: '<html>...' }] } or similar
+    console.log('  Decodo response keys:', Object.keys(data));
     const html = data?.results?.[0]?.content || data?.content || data?.html || null;
-    if (!html) { console.error('Decodo empty response:', JSON.stringify(data).slice(0,300)); }
+    if (!html) { console.error('  Decodo empty HTML. Full response:', JSON.stringify(data).slice(0,500)); }
     return html;
   } catch(e) {
-    console.error('Decodo fetch error:', e.message);
+    console.error('  Decodo fetch error:', e.message);
     return null;
   }
-}
-
-function safeNumFromText(text) {
-  const n = parseInt(text.replace(/,/g,''), 10);
-  return Number.isFinite(n) ? n : 0;
 }
 
 function extractListingsAndPricesFromHtml(html) {
@@ -168,7 +161,6 @@ async function scrapeEvent(event) {
 
   try {
     const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
-    console.log('  Fetching via Decodo:', url);
     const html = await fetchWithDecodo(url);
     if (!html) { console.error('  No HTML returned for', eventId); return null; }
 
@@ -192,7 +184,6 @@ async function scrapeEvent(event) {
       source:'decodo'
     });
 
-    // Update event record with better data
     const updates = {};
     if (name !== originalName) updates.name = name;
     if (venue && venue !== event.venue) updates.venue = venue;

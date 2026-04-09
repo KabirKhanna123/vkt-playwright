@@ -1,267 +1,208 @@
-async function fetchWithDecodo(url) {
+const { createClient } = require('@supabase/supabase-js');
+
+console.log('🚀 SCRAPER FILE LOADED');
+
+// ===== ENV =====
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const VKT_API = process.env.VKT_API;
+const DECODO_TOKEN = process.env.DECODO_TOKEN;
+
+if (!SUPABASE_URL || !SUPABASE_KEY || !VKT_API || !DECODO_TOKEN) {
+  throw new Error('❌ Missing required environment variables');
+}
+
+const SCRAPE_DELAY_MS = 4000;
+const RECENT_HOURS = 20;
+const EVENT_LIMIT = 200;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ===== HELPERS =====
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function summarizePrices(prices) {
+  const valid = prices.filter(p => p > 0 && p < 25000).sort((a,b)=>a-b);
+  if (!valid.length) return { floor:null, avg:null, ceiling:null };
+
+  return {
+    floor: Math.round(valid[0]),
+    avg: Math.round(valid.reduce((a,b)=>a+b,0)/valid.length),
+    ceiling: Math.round(valid[valid.length-1])
+  };
+}
+
+// ===== FETCH EVENTS =====
+async function getEvents() {
+  const { data, error } = await supabase
+    .from('events')
+    .select('id,name,date,venue')
+    .limit(EVENT_LIMIT);
+
+  if (error) {
+    console.error('❌ Failed to fetch events:', error.message);
+    return [];
+  }
+  return data || [];
+}
+
+// ===== SCRAPED RECENTLY =====
+async function scrapedRecently(eventId) {
+  const since = new Date(Date.now() - RECENT_HOURS * 3600000).toISOString();
+
+  const { data } = await supabase
+    .from('volume_snapshots')
+    .select('id')
+    .eq('event_id', eventId)
+    .gte('scraped_at', since)
+    .limit(1);
+
+  return !!(data && data.length);
+}
+
+// ===== POST SNAPSHOT =====
+async function postSnapshot(payload) {
   try {
-    const response = await fetch('https://scraper-api.decodo.com/v2/scrape', {
+    const r = await fetch(`${VKT_API}/api/snapshot`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!r.ok) {
+      console.error('❌ Snapshot failed:', await r.text());
+      return false;
+    }
+
+    return true;
+  } catch (e) {
+    console.error('❌ Snapshot error:', e.message);
+    return false;
+  }
+}
+
+// ===== DECODO FETCH =====
+async function fetchHTML(url) {
+  try {
+    console.log('🌐 Fetching:', url);
+
+    const res = await fetch('https://scraper-api.decodo.com/v2/scrape', {
       method: 'POST',
       headers: {
-        'Accept': 'application/json',
         'Authorization': 'Basic ' + DECODO_TOKEN,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         url,
         proxy_pool: 'premium',
-        headless: 'html',
+        headless: 'chrome',
         render: true,
-        wait: 8000,
-        wait_for_selector: 'script, body'
+        wait: 8000
       })
     });
 
-    if (!response.ok) {
-      console.error('  Decodo error:', response.status, await response.text());
+    if (!res.ok) {
+      console.error('❌ Decodo error:', res.status);
       return null;
     }
 
-    const data = await response.json();
-    const html =
-      data?.results?.[0]?.content ||
-      data?.results?.[0]?.html ||
-      data?.content ||
-      data?.html ||
-      null;
+    const data = await res.json();
+    const html = data?.results?.[0]?.content;
+
+    console.log('📄 HTML length:', html?.length || 0);
 
     return html;
   } catch (e) {
-    console.error('  Decodo fetch error:', e.message);
+    console.error('❌ Fetch error:', e.message);
     return null;
   }
 }
 
-function extractEmbeddedJsonCandidates(html) {
-  const candidates = [];
-
-  const pushCandidate = (raw) => {
-    if (!raw || typeof raw !== 'string') return;
-    const s = raw.trim();
-    if (!s) return;
-    candidates.push(s);
-  };
-
-  // Plain JSON scripts
-  for (const match of html.matchAll(/<script[^>]*>\s*([\[{][\s\S]*?)<\/script>/gi)) {
-    pushCandidate(match[1]);
-  }
-
-  // window.__INITIAL_STATE__ = {...}
-  for (const match of html.matchAll(/window\.(?:__INITIAL_STATE__|__STATE__|__DATA__)\s*=\s*({[\s\S]*?});/gi)) {
-    pushCandidate(match[1]);
-  }
-
-  // JSON.parse("...")
-  for (const match of html.matchAll(/JSON\.parse\(\s*"((?:\\.|[^"\\])*)"\s*\)/gi)) {
-    try {
-      const unescaped = JSON.parse(`"${match[1]}"`);
-      pushCandidate(unescaped);
-    } catch (_) {}
-  }
-
-  // Next.js / hydration blobs that contain quoted JSON fragments
-  for (const match of html.matchAll(/self\.__next_f\.push\(\[.*?("(?:\\.|[^"\\])*").*?\]\)/gi)) {
-    try {
-      const unescaped = JSON.parse(match[1]);
-      pushCandidate(unescaped);
-    } catch (_) {}
-  }
-
-  return candidates;
-}
-
-function extractFromHtml(html) {
-  let name = null;
-  let date = null;
-  let venue = null;
+// ===== EXTRACT DATA =====
+function extractData(html) {
   let totalListings = 0;
   const prices = [];
 
-  const seenObjects = new WeakSet();
-
-  function addPrice(v) {
-    const n = Number(v);
-    if (Number.isFinite(n) && n > 0 && n < 25000) prices.push(n);
+  // --- listing count ---
+  const listingMatch = html.match(/(\d[\d,]+)\s+(tickets|listings)/i);
+  if (listingMatch) {
+    totalListings = parseInt(listingMatch[1].replace(/,/g,''), 10);
   }
 
-  function maybeSetMeta(obj) {
-    if (!obj || typeof obj !== 'object') return;
-
-    const eventNameKeys = ['name', 'eventName', 'title'];
-    for (const key of eventNameKeys) {
-      const val = obj[key];
-      if (!name && typeof val === 'string' && val.trim() && !/tickets/i.test(val)) {
-        name = val.trim();
-      }
-    }
-
-    const dateKeys = ['startDate', 'eventDate', 'localDate'];
-    for (const key of dateKeys) {
-      const val = obj[key];
-      if (!date && typeof val === 'string') {
-        const normalized = normalizeDateString(val);
-        if (normalized) date = normalized;
-      }
-    }
-
-    if (!venue) {
-      const venueCandidates = [
-        obj.venue,
-        obj.location,
-        obj.eventVenue,
-        obj.venueName
-      ];
-
-      for (const v of venueCandidates) {
-        if (typeof v === 'string' && v.trim()) {
-          venue = v.trim();
-          break;
-        }
-        if (v && typeof v === 'object') {
-          const vn = v.name || v.venueName;
-          const city = v.address?.addressLocality || v.city || '';
-          const state = v.address?.addressRegion || v.state || '';
-          const built = [vn, city, state].filter(Boolean).join(', ');
-          if (built) {
-            venue = built;
-            break;
-          }
-        }
-      }
-    }
+  // --- prices ---
+  for (const m of html.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+    const val = parseFloat(m[1].replace(/,/g,''));
+    if (val > 1 && val < 25000) prices.push(val);
   }
 
-  function walk(obj) {
-    if (!obj || typeof obj !== 'object') return;
-    if (seenObjects.has(obj)) return;
-    seenObjects.add(obj);
+  prices.sort((a,b)=>a-b);
 
-    maybeSetMeta(obj);
+  console.log(`📊 Parsed → listings=${totalListings}, prices=${prices.length}`);
 
-    const listingCountKeys = [
-      'totalListings',
-      'listingCount',
-      'numListings',
-      'totalTickets',
-      'numFound',
-      'ticketCount',
-      'availableListings',
-      'listingTotal'
-    ];
-
-    for (const key of listingCountKeys) {
-      if (typeof obj[key] === 'number' && obj[key] > totalListings) {
-        totalListings = obj[key];
-      }
-    }
-
-    const priceKeys = [
-      'currentPrice',
-      'listingPrice',
-      'pricePerTicket',
-      'minPrice',
-      'maxPrice',
-      'price',
-      'amount',
-      'displayPrice',
-      'faceValue',
-      'allInPrice',
-      'buyerPrice',
-      'sellPrice',
-      'lowestPrice'
-    ];
-
-    for (const key of priceKeys) {
-      const val = obj[key];
-      if (typeof val === 'number') addPrice(val);
-      else if (val && typeof val === 'object') {
-        if (typeof val.amount === 'number') addPrice(val.amount);
-        if (typeof val.value === 'number') addPrice(val.value);
-      }
-    }
-
-    if (Array.isArray(obj)) {
-      for (const item of obj) walk(item);
-      return;
-    }
-
-    for (const k of Object.keys(obj)) {
-      walk(obj[k]);
-    }
-  }
-
-  // 1) JSON-LD first
-  const jsonLdMatches = [...html.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
-  for (const match of jsonLdMatches) {
-    try {
-      const parsed = JSON.parse(match[1]);
-      walk(parsed);
-    } catch (_) {}
-  }
-
-  // 2) Embedded/hydrated app state
-  const candidates = extractEmbeddedJsonCandidates(html);
-  for (const raw of candidates) {
-    try {
-      const parsed = JSON.parse(raw);
-      walk(parsed);
-      continue;
-    } catch (_) {}
-
-    // Sometimes candidate is a larger JS string that contains JSON fragments
-    for (const inner of raw.matchAll(/({[\s\S]*})/g)) {
-      try {
-        const parsed = JSON.parse(inner[1]);
-        walk(parsed);
-      } catch (_) {}
-    }
-  }
-
-  // 3) Regex fallback for listing count
-  if (!totalListings) {
-    const listingMatches = [...html.matchAll(/(\d[\d,]*)\s+listings?/gi)]
-      .map(m => parseInt(m[1].replace(/,/g, ''), 10))
-      .filter(v => Number.isFinite(v) && v > 0);
-
-    if (listingMatches.length) totalListings = Math.max(...listingMatches);
-  }
-
-  // 4) Regex fallback for prices
-  if (!prices.length) {
-    for (const match of html.matchAll(/[$£€]\s*([\d,]+(?:\.\d{2})?)/g)) {
-      const value = parseFloat(match[1].replace(/,/g, ''));
-      addPrice(value);
-    }
-  }
-
-  // 5) Title fallback
-  if (!name) {
-    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-    if (titleMatch) {
-      const cleaned = titleMatch[1]
-        .replace(/\s*tickets\s*[-–|].*$/i, '')
-        .replace(/\s*[-–|].*$/i, '')
-        .trim();
-
-      if (cleaned && !/tickets/i.test(cleaned)) {
-        name = cleaned;
-      }
-    }
-  }
-
-  prices.sort((a, b) => a - b);
-
-  console.log(
-    '  Parsed: listings=' + totalListings +
-    ', prices=' + prices.length +
-    (prices.length ? ', floor=$' + Math.round(prices[0]) : '')
-  );
-
-  return { name, date, venue, totalListings, prices };
+  return { totalListings, prices };
 }
+
+// ===== SCRAPE EVENT =====
+async function scrapeEvent(event) {
+  const url = `https://www.stubhub.com/event/${event.id}/?quantity=0`;
+
+  const html = await fetchHTML(url);
+  if (!html) return null;
+
+  const { totalListings, prices } = extractData(html);
+
+  const summary = summarizePrices(prices);
+
+  if (!summary.floor) {
+    console.log('⚠️ No pricing found');
+    return null;
+  }
+
+  console.log(`💰 Floor: $${summary.floor} | Avg: $${summary.avg}`);
+
+  await postSnapshot({
+    eventId: event.id,
+    eventName: event.name,
+    eventDate: event.date,
+    venue: event.venue,
+    platform: 'StubHub',
+    totalListings,
+    eventFloor: summary.floor,
+    eventAvg: summary.avg,
+    eventCeiling: summary.ceiling
+  });
+
+  return true;
+}
+
+// ===== MAIN =====
+async function main() {
+  console.log('🚀 MAIN STARTED');
+
+  const events = await getEvents();
+  console.log('🎯 Events:', events.length);
+
+  let scraped = 0;
+
+  for (const event of events) {
+    const recent = await scrapedRecently(event.id);
+    if (recent) {
+      console.log('⏭️ Skipping recent:', event.name);
+      continue;
+    }
+
+    console.log('\n🎟️ Scraping:', event.name);
+
+    const ok = await scrapeEvent(event);
+    if (ok) scraped++;
+
+    await sleep(SCRAPE_DELAY_MS);
+  }
+
+  console.log(`\n✅ DONE → scraped: ${scraped}`);
+}
+
+main().catch(e => {
+  console.error('❌ Fatal:', e);
+  process.exit(1);
+});

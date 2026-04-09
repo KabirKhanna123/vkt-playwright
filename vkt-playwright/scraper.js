@@ -1,11 +1,14 @@
 const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 
-const SUPABASE_URL  = process.env.SUPABASE_URL  || 'https://unypasitbzulafehbqtj.supabase.co';
-const SUPABASE_KEY  = process.env.SUPABASE_KEY  || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
-const VKT_API       = process.env.VKT_API       || 'https://vkt-volume-api.vercel.app';
-const SCRAPE_DELAY  = parseInt(process.env.SCRAPE_DELAY || '6000', 10);
-const SECTION_DELAY = parseInt(process.env.SECTION_DELAY || '2500', 10);
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'YOUR_SUPABASE_KEY';
+const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
+
+const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '5000', 10);
+const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '2500', 10);
+const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
+const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -18,13 +21,30 @@ function safeNum(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function summarizePrices(prices) {
+  const valid = (prices || [])
+    .map(safeNum)
+    .filter(v => v > 0 && v < 25000)
+    .sort((a, b) => a - b);
+
+  if (!valid.length) {
+    return { floor: null, avg: null, ceiling: null };
+  }
+
+  return {
+    floor: valid[0],
+    avg: Math.round(valid.reduce((a, b) => a + b, 0) / valid.length),
+    ceiling: valid[valid.length - 1]
+  };
+}
+
 async function getEvents() {
   const { data, error } = await supabase
     .from('events')
     .select('id, name, date, venue, platform')
     .not('id', 'like', 'tm_%')
     .order('date', { ascending: true })
-    .limit(200);
+    .limit(EVENT_LIMIT);
 
   if (error) {
     console.error('❌ Failed to fetch events:', error.message);
@@ -34,8 +54,8 @@ async function getEvents() {
   return data || [];
 }
 
-async function scrapedRecently(eventId, hours = 20) {
-  const since = new Date(Date.now() - hours * 3600000).toISOString();
+async function scrapedRecently(eventId, hours = RECENT_HOURS) {
+  const since = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
 
   const { data, error } = await supabase
     .from('volume_snapshots')
@@ -46,7 +66,7 @@ async function scrapedRecently(eventId, hours = 20) {
     .limit(1);
 
   if (error) {
-    console.error(`❌ scrapedRecently failed for ${eventId}:`, error.message);
+    console.error(`❌ Failed recent-check for ${eventId}:`, error.message);
     return false;
   }
 
@@ -55,18 +75,18 @@ async function scrapedRecently(eventId, hours = 20) {
 
 async function postSnapshot(payload) {
   try {
-    const r = await fetch(`${VKT_API}/api/snapshot`, {
+    const response = await fetch(`${VKT_API}/api/snapshot`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
 
-    const text = await r.text();
+    const text = await response.text();
 
-    if (!r.ok) {
+    if (!response.ok) {
       console.error('❌ Snapshot failed:', {
-        status: r.status,
-        statusText: r.statusText,
+        status: response.status,
+        statusText: response.statusText,
         body: text,
         payload
       });
@@ -74,63 +94,80 @@ async function postSnapshot(payload) {
     }
 
     return true;
-  } catch (e) {
-    console.error('❌ Snapshot request crashed:', e.message, payload);
+  } catch (error) {
+    console.error('❌ Snapshot request crashed:', error.message, payload);
     return false;
   }
 }
 
-async function dismissModal(page) {
-  try {
-    const btn = page.locator('button:has-text("Continue"), button:has-text("Close"), button[aria-label="Close"]').first();
-    if (await btn.isVisible({ timeout: 2000 })) {
-      await btn.click();
-      await page.waitForTimeout(600);
-    }
-  } catch (e) {}
+async function dismissModals(page) {
+  const selectors = [
+    'button:has-text("Continue")',
+    'button:has-text("Close")',
+    'button[aria-label="Close"]',
+    '[data-testid="close-button"]'
+  ];
+
+  for (const selector of selectors) {
+    try {
+      const el = page.locator(selector).first();
+      if (await el.isVisible({ timeout: 800 })) {
+        await el.click({ timeout: 1000 });
+        await page.waitForTimeout(500);
+      }
+    } catch (_) {}
+  }
 }
 
 async function extractJsonLdName(page) {
   try {
     return await page.evaluate(() => {
-      const els = document.querySelectorAll('script[type="application/ld+json"]');
-      for (const el of els) {
+      const nodes = document.querySelectorAll('script[type="application/ld+json"]');
+
+      for (const node of nodes) {
         try {
-          const d = JSON.parse(el.textContent);
-          if (Array.isArray(d)) {
-            for (const item of d) {
-              if (item?.name && (item['@type'] === 'Event' || item['@type'] === 'SportsEvent')) {
+          const parsed = JSON.parse(node.textContent);
+
+          if (Array.isArray(parsed)) {
+            for (const item of parsed) {
+              if (item && item.name && (item['@type'] === 'Event' || item['@type'] === 'SportsEvent')) {
                 return item.name;
               }
             }
-          } else if (d?.name && (d['@type'] === 'Event' || d['@type'] === 'SportsEvent')) {
-            return d.name;
+          } else if (parsed && parsed.name && (parsed['@type'] === 'Event' || parsed['@type'] === 'SportsEvent')) {
+            return parsed.name;
           }
-        } catch (e) {}
+        } catch (_) {}
       }
+
       return null;
     });
-  } catch (e) {
+  } catch (_) {
     return null;
   }
 }
 
-async function extractEventDate(page) {
+async function extractEventDateText(page) {
   try {
     return await page.evaluate(() => {
-      const el = document.querySelector('time') || document.querySelector('[data-testid="event-date"]');
-      return el ? el.textContent.trim() : null;
+      const timeEl = document.querySelector('time');
+      if (timeEl?.textContent?.trim()) return timeEl.textContent.trim();
+
+      const testIdEl = document.querySelector('[data-testid="event-date"]');
+      if (testIdEl?.textContent?.trim()) return testIdEl.textContent.trim();
+
+      return null;
     });
-  } catch (e) {
+  } catch (_) {
     return null;
   }
 }
 
-async function extractPageListingsAndPrices(page) {
+async function extractListingsAndPrices(page) {
   return await page.evaluate(() => {
-    const text = document.body.innerText || '';
+    const bodyText = document.body?.innerText || '';
 
-    const listingMatches = [...text.matchAll(/(\d[\d,]*)\s+listings?/gi)]
+    const listingMatches = [...bodyText.matchAll(/(\d[\d,]*)\s+listings?/gi)]
       .map(m => parseInt(m[1].replace(/,/g, ''), 10))
       .filter(v => Number.isFinite(v) && v >= 0);
 
@@ -142,14 +179,16 @@ async function extractPageListingsAndPrices(page) {
 
     while ((node = walker.nextNode())) {
       if (!node.parentElement) continue;
-      if (node.parentElement.closest('svg,script,style,noscript')) continue;
+      if (node.parentElement.closest('script,style,noscript,svg')) continue;
 
       const style = window.getComputedStyle(node.parentElement);
       if (style.display === 'none' || style.visibility === 'hidden') continue;
 
-      for (const m of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-        const v = parseFloat(m[1].replace(/,/g, ''));
-        if (v >= 1 && v <= 25000) prices.push(v);
+      for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+        const value = parseFloat(match[1].replace(/,/g, ''));
+        if (Number.isFinite(value) && value >= 1 && value <= 25000) {
+          prices.push(value);
+        }
       }
     }
 
@@ -159,18 +198,6 @@ async function extractPageListingsAndPrices(page) {
   });
 }
 
-function summarizePrices(prices) {
-  if (!prices || !prices.length) {
-    return { floor: null, avg: null, ceiling: null };
-  }
-
-  const floor = prices[0];
-  const ceiling = prices[prices.length - 1];
-  const avg = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
-
-  return { floor, avg, ceiling };
-}
-
 async function getSectionIds(page) {
   try {
     return await page.evaluate(() => {
@@ -178,118 +205,118 @@ async function getSectionIds(page) {
       const seen = new Set();
 
       document.querySelectorAll('[sprite-identifier]').forEach(el => {
-        const val = el.getAttribute('sprite-identifier');
-        if (val && /^s\d+$/i.test(val) && !seen.has(val)) {
-          seen.add(val);
-          ids.push(val.replace(/^s/i, ''));
+        const value = el.getAttribute('sprite-identifier');
+        if (value && /^s\d+$/i.test(value) && !seen.has(value)) {
+          seen.add(value);
+          ids.push(value.replace(/^s/i, ''));
         }
       });
 
       return ids;
     });
-  } catch (e) {
+  } catch (_) {
     return [];
   }
 }
 
-async function getSectionNameFromMap(page, sectionId) {
+async function getSectionName(page, sectionId) {
   try {
-    const fromMap = await page.evaluate((sid) => {
+    const sectionName = await page.evaluate((sid) => {
       const el = document.querySelector(`[sprite-identifier="s${sid}"]`);
       if (!el) return null;
 
-      const directLabel =
+      const direct =
         el.getAttribute('aria-label') ||
         el.getAttribute('data-section-name') ||
         el.getAttribute('title');
 
-      if (directLabel && directLabel.trim()) return directLabel.trim();
+      if (direct && direct.trim()) return direct.trim();
 
       const parent = el.closest('g');
       if (parent) {
-        const text = parent.querySelector('text');
-        if (text?.textContent?.trim()) return text.textContent.trim();
+        const textNode = parent.querySelector('text');
+        if (textNode?.textContent?.trim()) return textNode.textContent.trim();
       }
 
       return null;
     }, sectionId);
 
-    return fromMap || `Section ${sectionId}`;
-  } catch (e) {
+    return sectionName || `Section ${sectionId}`;
+  } catch (_) {
     return `Section ${sectionId}`;
   }
 }
 
-async function scrapeSection(page, eventId, sectionId, fallbackName, eventTotal) {
-  const sectionUrl = `https://www.stubhub.com/event/${eventId}/?sections=${sectionId}&quantity=0`;
+async function gotoEventPage(page, eventId, sectionId = null) {
+  const url = sectionId
+    ? `https://www.stubhub.com/event/${eventId}/?sections=${sectionId}&quantity=0`
+    : `https://www.stubhub.com/event/${eventId}/?quantity=0`;
 
+  await page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: 30000
+  });
+
+  await page.waitForTimeout(sectionId ? SECTION_DELAY_MS : 3500);
+  await dismissModals(page);
+
+  return url;
+}
+
+async function scrapeSection(page, eventId, sectionId, fallbackName) {
   try {
-    console.log(`   → Loading section ${sectionId}`);
+    const url = await gotoEventPage(page, eventId, sectionId);
+    console.log(`   → Section ${sectionId}: ${url}`);
 
-    await page.goto(sectionUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(SECTION_DELAY);
-    await dismissModal(page);
-
-    const { totalListings, prices } = await extractPageListingsAndPrices(page);
-
-    if (!prices.length) {
-      console.log(`   ⚠ Section ${sectionId}: no prices found`);
-      return null;
-    }
-
+    const { totalListings, prices } = await extractListingsAndPrices(page);
     const summary = summarizePrices(prices);
 
-    // Keep obvious bad loads out, but do NOT drop just because listings === event total.
-    // Your current code drops those rows, which is why sections stay blank. :contentReference[oaicite:2]{index=2}
     if (!summary.floor || !summary.avg || !summary.ceiling) {
+      console.log(`   ⚠ Section ${sectionId}: no usable price data`);
       return null;
     }
 
-    const sectionName = fallbackName || `Section ${sectionId}`;
-
     return {
-      section: sectionName,
+      section: fallbackName || `Section ${sectionId}`,
       sectionListings: totalListings || 0,
       sectionFloor: summary.floor,
       sectionAvg: summary.avg,
       sectionCeiling: summary.ceiling
     };
-  } catch (e) {
-    console.log(`   ⚠ Section ${sectionId} failed: ${e.message}`);
+  } catch (error) {
+    console.log(`   ⚠ Section ${sectionId} failed: ${error.message}`);
     return null;
   }
 }
 
-async function scrapeEvent(page, eventId, eventName) {
-  const baseUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
-  console.log(`  Navigating to ${baseUrl}`);
+async function scrapeEvent(page, event) {
+  const eventId = event.id;
+  const originalName = event.name || `Event ${eventId}`;
 
   try {
-    await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(4000);
-    await dismissModal(page);
+    const baseUrl = await gotoEventPage(page, eventId);
+    console.log(`  Opened ${baseUrl}`);
 
-    const jsonLdName = await extractJsonLdName(page);
-    const name = jsonLdName || eventName;
-    const eventDate = await extractEventDate(page);
+    const betterName = await extractJsonLdName(page);
+    const eventDateText = await extractEventDateText(page);
 
-    const { totalListings, prices } = await extractPageListingsAndPrices(page);
+    const name = betterName || originalName;
+    const { totalListings, prices } = await extractListingsAndPrices(page);
+    const eventSummary = summarizePrices(prices);
 
-    if (!prices.length) {
-      console.log(`  ⚠ No prices found for ${name}`);
+    if (!eventSummary.floor || !eventSummary.avg || !eventSummary.ceiling) {
+      console.log(`  ⚠ ${name}: no event-level pricing found`);
       return null;
     }
 
-    const eventSummary = summarizePrices(prices);
-
     console.log(
-      `  ✓ ${name}: ${totalListings} listings, floor $${eventSummary.floor}, ATP $${eventSummary.avg}`
+      `  ✓ ${name}: listings=${totalListings}, floor=$${eventSummary.floor}, atp=$${eventSummary.avg}`
     );
 
     const eventPosted = await postSnapshot({
       eventId,
       eventName: name,
-      eventDate,
+      eventDate: eventDateText || event.date || null,
       platform: 'StubHub',
       totalListings,
       section: null,
@@ -297,32 +324,35 @@ async function scrapeEvent(page, eventId, eventName) {
       eventFloor: eventSummary.floor,
       eventAvg: eventSummary.avg,
       eventCeiling: eventSummary.ceiling,
-      source: 'playwright'
+      source: 'playwright-url'
     });
 
     if (!eventPosted) {
       console.log(`  ⚠ Event-level snapshot failed for ${eventId}`);
     }
 
-    if (jsonLdName && jsonLdName !== eventName) {
-      await supabase.from('events').update({ name: jsonLdName }).eq('id', eventId);
+    if (betterName && betterName !== originalName) {
+      await supabase
+        .from('events')
+        .update({ name: betterName })
+        .eq('id', eventId);
     }
 
     const sectionIds = await getSectionIds(page);
-    console.log(`  Found ${sectionIds.length} sections on map`);
+    console.log(`  Found ${sectionIds.length} section ids`);
 
-    let sectionsCompleted = 0;
+    let postedSections = 0;
 
     for (const sectionId of sectionIds) {
-      const sectionName = await getSectionNameFromMap(page, sectionId);
-      const sectionData = await scrapeSection(page, eventId, sectionId, sectionName, totalListings);
+      const sectionName = await getSectionName(page, sectionId);
+      const sectionData = await scrapeSection(page, eventId, sectionId, sectionName);
 
       if (!sectionData) continue;
 
-      const posted = await postSnapshot({
+      const ok = await postSnapshot({
         eventId,
         eventName: name,
-        eventDate,
+        eventDate: eventDateText || event.date || null,
         platform: 'StubHub',
         totalListings,
         section: sectionData.section,
@@ -331,32 +361,49 @@ async function scrapeEvent(page, eventId, eventName) {
         sectionAvg: sectionData.sectionAvg,
         sectionCeiling: sectionData.sectionCeiling,
         eventFloor: eventSummary.floor,
-        source: 'playwright'
+        source: 'playwright-url'
       });
 
-      if (posted) {
-        sectionsCompleted++;
-      }
+      if (ok) postedSections += 1;
 
-      await sleep(800);
+      await sleep(700);
     }
 
-    console.log(`  ✓ Scraped ${sectionsCompleted}/${sectionIds.length} sections`);
+    console.log(`  ✓ Posted ${postedSections}/${sectionIds.length} section rows`);
 
     return {
       ok: true,
-      listings: totalListings,
-      sections: sectionIds.length,
-      completed: sectionsCompleted
+      eventId,
+      name,
+      totalListings,
+      sectionIds: sectionIds.length,
+      postedSections
     };
-  } catch (e) {
-    console.error(`  ✗ Error scraping ${eventId}:`, e.message);
+  } catch (error) {
+    console.error(`  ✗ Failed event ${eventId}: ${error.message}`);
     return null;
   }
 }
 
 async function main() {
-  console.log('🎟 VKT Playwright Scraper starting...');
+  console.log('🎟 Starting VKT StubHub scraper...');
+
+  const manualEventId = process.argv[2];
+  let events = [];
+
+  if (manualEventId) {
+    events = [{
+      id: manualEventId,
+      name: 'Manual Run',
+      date: null,
+      venue: null,
+      platform: 'StubHub'
+    }];
+    console.log(`Manual mode: event ${manualEventId}`);
+  } else {
+    events = await getEvents();
+    console.log(`Fetched ${events.length} events`);
+  }
 
   const browser = await chromium.launch({
     headless: true,
@@ -365,15 +412,15 @@ async function main() {
       '--disable-setuid-sandbox',
       '--disable-blink-features=AutomationControlled',
       '--disable-dev-shm-usage',
-      '--window-size=1280,800'
+      '--window-size=1280,900'
     ]
   });
 
   const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
+    viewport: { width: 1280, height: 900 },
     locale: 'en-US',
-    timezoneId: 'America/New_York'
+    timezoneId: 'America/Los_Angeles',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
   });
 
   const page = await context.newPage();
@@ -384,41 +431,38 @@ async function main() {
     window.chrome = { runtime: {} };
   });
 
-  const events = await getEvents();
-  console.log(`Found ${events.length} StubHub events to check`);
-
   let scraped = 0;
   let skipped = 0;
   let failed = 0;
 
   for (const event of events) {
-    const recent = await scrapedRecently(event.id);
-
-    if (recent) {
-      console.log(`⏭ Skipping ${event.name} (scraped recently)`);
-      skipped++;
-      continue;
+    if (!manualEventId) {
+      const recent = await scrapedRecently(event.id);
+      if (recent) {
+        console.log(`⏭ Skipping ${event.name} (${event.id}) - scraped recently`);
+        skipped += 1;
+        continue;
+      }
     }
 
-    console.log(`\n🔍 Scraping: ${event.name} (${event.date || 'no date'})`);
-    const result = await scrapeEvent(page, event.id, event.name);
+    console.log(`\n🔍 Scraping ${event.name} (${event.id})`);
+    const result = await scrapeEvent(page, event);
 
-    if (result) {
-      scraped++;
-    } else {
-      failed++;
-    }
+    if (result) scraped += 1;
+    else failed += 1;
 
-    await page.waitForTimeout(SCRAPE_DELAY);
+    await sleep(SCRAPE_DELAY_MS);
   }
 
   await browser.close();
 
-  console.log(`\n✅ Done — ${scraped} scraped, ${skipped} skipped, ${failed} failed`);
-  process.exit(0);
+  console.log('\n✅ Finished');
+  console.log(`Scraped: ${scraped}`);
+  console.log(`Skipped: ${skipped}`);
+  console.log(`Failed: ${failed}`);
 }
 
-main().catch(e => {
-  console.error('Fatal error:', e);
+main().catch(error => {
+  console.error('Fatal error:', error);
   process.exit(1);
 });

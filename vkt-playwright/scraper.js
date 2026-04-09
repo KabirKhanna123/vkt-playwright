@@ -1,4 +1,4 @@
-\const { chromium } = require('playwright');
+const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
@@ -146,7 +146,6 @@ async function extractStructuredEventData(page) {
       for (const script of scripts) {
         try {
           const parsed = JSON.parse(script.textContent);
-
           const items = Array.isArray(parsed) ? parsed : [parsed];
 
           for (const item of items) {
@@ -199,6 +198,49 @@ async function extractMetaEventData(page) {
     });
   } catch (_) {
     return { title: null, description: null };
+  }
+}
+
+async function extractBestEventName(page) {
+  try {
+    return await page.evaluate(() => {
+      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+
+      for (const script of scripts) {
+        try {
+          const data = JSON.parse(script.textContent);
+          const items = Array.isArray(data) ? data : [data];
+
+          for (const item of items) {
+            if (
+              item &&
+              (item['@type'] === 'Event' || item['@type'] === 'SportsEvent') &&
+              item.name &&
+              !String(item.name).toLowerCase().includes('tickets')
+            ) {
+              return String(item.name).trim();
+            }
+          }
+        } catch (_) {}
+      }
+
+      const h1 = document.querySelector('h1');
+      if (h1?.textContent) {
+        const txt = h1.textContent.trim();
+        if (txt && !txt.toLowerCase().includes('tickets')) {
+          return txt;
+        }
+      }
+
+      let title = document.title || '';
+      title = title.replace(/\s*\|\s*StubHub.*$/i, '');
+      title = title.replace(/\s*Tickets.*$/i, '');
+      title = title.trim();
+
+      return title || null;
+    });
+  } catch (_) {
+    return null;
   }
 }
 
@@ -408,8 +450,14 @@ async function scrapeEvent(page, event) {
     console.log(`  Opened ${baseUrl}`);
 
     const pageDetails = await extractEventPageDetails(page);
+    const betterName = await extractBestEventName(page);
 
-    const name = pageDetails.name || originalName;
+    let name = betterName || pageDetails.name || originalName;
+
+    if (name && name.toLowerCase().includes('tickets')) {
+      name = pageDetails.name || originalName;
+    }
+
     const stubhubVenue = pageDetails.venue || event.venue || null;
     const stubhubDate = pageDetails.date || event.date || null;
 

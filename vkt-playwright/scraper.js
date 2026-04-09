@@ -100,7 +100,58 @@ async function extractPageData(page) {
       if (name && date && venue) break;
     }
 
-    // Listing count and prices from page text
+    // Listing count from page text
+    const bodyText = document.body?.innerText || '';
+    const listingMatches = [...bodyText.matchAll(/(\d[\d,]*)\s+listings?/gi)]
+      .map(m => parseInt(m[1].replace(/,/g,''), 10))
+      .filter(v => Number.isFinite(v) && v >= 0);
+    const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
+
+    // Prices from visible text
+    const prices = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (!node.parentElement) continue;
+      if (node.parentElement.closest('script,style,noscript,svg')) continue;
+      const style = window.getComputedStyle(node.parentElement);
+      if (style.display==='none' || style.visibility==='hidden') continue;
+      for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+        const value = parseFloat(match[1].replace(/,/g,''));
+        if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
+      }
+    }
+    prices.sort((a,b)=>a-b);
+
+    // Extract real section names from listing cards
+    const sectionNames = new Set();
+    // Method 1: look for "Section X" text in listing cards
+    const allText = document.querySelectorAll('*');
+    for (const el of allText) {
+      if (el.children.length > 0) continue; // leaf nodes only
+      const text = el.textContent?.trim();
+      if (!text) continue;
+      // Match "Section 112", "Section A", "Field Level", "Lower Bowl", "Upper Deck" etc
+      const secMatch = text.match(/^(Section\s+[\w\d]+|[A-Z][a-z]+\s+(?:Level|Bowl|Deck|Box|Club|Field|End Zone|Corner|Loge|Mezzanine|Suite|Row\s+\w+))$/i);
+      if (secMatch) sectionNames.add(secMatch[1].trim());
+    }
+
+    // Method 2: look for section headings in listing card structure
+    const sectionEls = document.querySelectorAll('[class*="section"],[data-section],[data-testid*="section"]');
+    for (const el of sectionEls) {
+      const text = el.textContent?.trim();
+      if (text && text.length < 50 && /section/i.test(text)) {
+        const clean = text.replace(/\s+/g, ' ').trim();
+        if (clean) sectionNames.add(clean);
+      }
+    }
+
+    return { name, date, venue, totalListings, prices, sectionNames: Array.from(sectionNames) };
+  });
+}
+
+async function extractSectionPrices(page) {
+  return await page.evaluate(() => {
     const bodyText = document.body?.innerText || '';
     const listingMatches = [...bodyText.matchAll(/(\d[\d,]*)\s+listings?/gi)]
       .map(m => parseInt(m[1].replace(/,/g,''), 10))
@@ -121,41 +172,18 @@ async function extractPageData(page) {
       }
     }
     prices.sort((a,b)=>a-b);
-
-    // Section IDs from SVG map
-    const sectionIds = [];
-    const seen = new Set();
-    document.querySelectorAll('[sprite-identifier]').forEach(el => {
-      const value = el.getAttribute('sprite-identifier');
-      if (value && /^s\d+$/i.test(value) && !seen.has(value)) {
-        seen.add(value);
-        // Try to get section name
-        const label = el.getAttribute('aria-label') || el.getAttribute('title') || null;
-        const parent = el.closest('g');
-        const textEl = parent ? parent.querySelector('text') : null;
-        const textLabel = textEl?.textContent?.trim() || null;
-        sectionIds.push({ id: value.replace(/^s/i,''), name: label || textLabel || null });
-      }
-    });
-
-    return { name, date, venue, totalListings, prices, sectionIds };
+    return { totalListings, prices };
   });
 }
 
-async function scrapeUrl(page, url, waitMs = 4000) {
+async function navigateTo(page, url, waitMs = 4000) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await randomDelay(waitMs, waitMs + 2000);
   await dismissModals(page);
-
-  // Check if we hit a bot challenge
   const title = await page.title();
-  const isChallenge = title === '' || title.toLowerCase().includes('just a moment') || title.toLowerCase().includes('checking');
-  if (isChallenge) {
-    console.log('  Bot challenge detected, waiting longer...');
+  if (!title || title.toLowerCase().includes('just a moment')) {
     await randomDelay(5000, 8000);
   }
-
-  return await extractPageData(page);
 }
 
 async function scrapeEvent(page, event) {
@@ -165,14 +193,14 @@ async function scrapeEvent(page, event) {
 
   try {
     const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
-    console.log('  Fetching:', url);
-    const data = await scrapeUrl(page, url);
+    await navigateTo(page, url);
+    const data = await extractPageData(page);
 
     let name = data.name || originalName;
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
     const venue = data.venue || event.venue || null;
     const date = normalizeDateString(data.date) || event.date || null;
-    const { totalListings, prices } = data;
+    const { totalListings, prices, sectionNames } = data;
 
     const summary = summarizePrices(prices);
     if (!summary.floor) { console.log('  No pricing for '+name); return null; }
@@ -194,42 +222,50 @@ async function scrapeEvent(page, event) {
     if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id',eventId);
 
     // Section scraping for major events
-    if (isMajor && data.sectionIds.length > 0) {
-      console.log('  Scraping '+data.sectionIds.length+' sections...');
-      let postedSections = 0;
+    if (isMajor) {
+      console.log('  Section names found: '+sectionNames.length);
+      if (sectionNames.length === 0) {
+        console.log('  No section names found in listing cards');
+      } else {
+        let postedSections = 0;
+        for (const sectionName of sectionNames) {
+          try {
+            // Encode section name for URL
+            const encoded = encodeURIComponent(sectionName);
+            const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${encoded}&quantity=0`;
+            await navigateTo(page, secUrl, SECTION_DELAY_MS);
+            const secData = await extractSectionPrices(page);
 
-      for (const section of data.sectionIds) {
-        try {
-          const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${section.id}&quantity=0`;
-          const secData = await scrapeUrl(page, secUrl, SECTION_DELAY_MS);
+            const secTotal = secData.totalListings;
+            if (!secTotal || secTotal === totalListings) {
+              await randomDelay(500, 1000);
+              continue;
+            }
 
-          const secTotal = secData.totalListings;
-          if (!secTotal || secTotal === totalListings) continue;
+            const secSummary = summarizePrices(secData.prices);
+            if (!secSummary.floor) {
+              await randomDelay(500, 1000);
+              continue;
+            }
 
-          const secSummary = summarizePrices(secData.prices);
-          if (!secSummary.floor) continue;
+            const ok = await postSnapshot({
+              eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
+              totalListings:0, section:sectionName, sectionListings:secTotal,
+              sectionFloor:secSummary.floor, sectionAvg:secSummary.avg, sectionCeiling:secSummary.ceiling,
+              eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
+              source:'playwright'
+            });
 
-          const sectionName = section.name || 'Section '+section.id;
+            if (ok) {
+              postedSections++;
+              console.log('    '+sectionName+': '+secTotal+' listings, floor $'+secSummary.floor);
+            }
 
-          const ok = await postSnapshot({
-            eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
-            totalListings:0, section:sectionName, sectionListings:secTotal,
-            sectionFloor:secSummary.floor, sectionAvg:secSummary.avg, sectionCeiling:secSummary.ceiling,
-            eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
-            source:'playwright'
-          });
-
-          if (ok) {
-            postedSections++;
-            console.log('    '+sectionName+': '+secTotal+' listings, floor $'+secSummary.floor);
-          }
-
-          await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 1500);
-        } catch(e) { console.error('    Section '+section.id+' failed:', e.message); continue; }
+            await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 1500);
+          } catch(e) { console.error('    Section "'+sectionName+'" failed:', e.message); continue; }
+        }
+        console.log('  Sections: '+postedSections+'/'+sectionNames.length+' posted');
       }
-      console.log('  Sections: '+postedSections+'/'+data.sectionIds.length+' posted');
-    } else if (isMajor) {
-      console.log('  No section IDs found in page');
     }
 
     return { ok:true };
@@ -272,7 +308,6 @@ async function main() {
     }
   });
 
-  // Stealth patches
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
@@ -282,7 +317,7 @@ async function main() {
 
   const page = await context.newPage();
 
-  // Warm up with a google visit first to look more human
+  // Warm up with google visit
   try {
     await page.goto('https://www.google.com', { waitUntil:'domcontentloaded', timeout:10000 });
     await randomDelay(1500, 3000);

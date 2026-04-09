@@ -68,9 +68,7 @@ async function fetchWithDecodo(url) {
       body: JSON.stringify({
         url: url,
         proxy_pool: 'premium',
-        headless: 'chrome',  // full browser render instead of html
-        wait_for_selector: 'body',
-        wait: 4000
+        headless: 'html'
       })
     });
     if (!response.ok) {
@@ -80,11 +78,6 @@ async function fetchWithDecodo(url) {
     const data = await response.json();
     const html = data?.results?.[0]?.content || data?.content || data?.html || null;
     console.log('  HTML length:', html ? html.length : 0);
-    // Log a middle section to see if listings data is present
-    if (html && html.length > 5000) {
-      const mid = Math.floor(html.length / 2);
-      console.log('  HTML mid-sample:', html.slice(mid, mid+500));
-    }
     return html;
   } catch(e) {
     console.error('  Decodo fetch error:', e.message);
@@ -145,8 +138,7 @@ function extractFromHtml(html) {
     }
   }
 
-  // --- Listing count: search all text for patterns ---
-  // Try "X tickets from" or "X listings" patterns
+  // --- Listing count from regex patterns ---
   const listingPatterns = [
     /(\d[\d,]+)\s+tickets?\s+from/gi,
     /(\d[\d,]+)\s+listings?/gi,
@@ -159,18 +151,18 @@ function extractFromHtml(html) {
     const matches = [...html.matchAll(pattern)].map(m => parseInt(m[1].replace(/,/g,''), 10)).filter(v => v > 0);
     if (matches.length) {
       totalListings = Math.max(...matches);
-      console.log('  Listing count pattern match: '+totalListings);
+      console.log('  Listing count found: '+totalListings);
       break;
     }
   }
 
-  // --- Prices: search all $ values in text ---
+  // --- Prices from $ text ---
   for (const match of html.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
     const value = parseFloat(match[1].replace(/,/g,''));
     if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
   }
 
-  // Also try JSON price fields
+  // --- Prices from JSON fields ---
   for (const match of html.matchAll(/"(?:currentPrice|listingPrice|pricePerTicket|minPrice|price|amount)"\s*:\s*([\d.]+)/g)) {
     const value = parseFloat(match[1]);
     if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);

@@ -258,8 +258,26 @@ async function main() {
   let events = manualId ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub' }] : await getEvents();
   console.log('Events to process: '+events.length);
 
-  const browser = await chromium.launch({ headless:true, args:['--no-sandbox','--disable-setuid-sandbox','--disable-blink-features=AutomationControlled','--disable-dev-shm-usage','--window-size=1280,900'] });
-  const context = await browser.newContext({ viewport:{width:1280,height:900}, locale:'en-US', timezoneId:'America/Los_Angeles', userAgent:'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' });
+  const PROXY_HOST = process.env.PROXY_HOST || 'gate.decodo.com';
+  const PROXY_PORT = process.env.PROXY_PORT || '10001';
+  const PROXY_USER = process.env.PROXY_USER || 'sp1byj77dj';
+  const PROXY_PASS = process.env.PROXY_PASS || 'Fqp6I_qj0derv1Um6K';
+
+  const browser = await chromium.launch({
+    headless: true,
+    proxy: {
+      server: 'http://' + PROXY_HOST + ':' + PROXY_PORT,
+      username: PROXY_USER,
+      password: PROXY_PASS
+    },
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-blink-features=AutomationControlled','--disable-dev-shm-usage','--window-size=1280,900']
+  });
+  const context = await browser.newContext({
+    viewport: {width:1280,height:900},
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+  });
   const page = await context.newPage();
   await page.addInitScript(() => { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); window.chrome={runtime:{}}; });
 

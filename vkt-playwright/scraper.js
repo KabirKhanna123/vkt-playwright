@@ -90,14 +90,16 @@ function extractFromHtml(html) {
   let totalListings = 0;
   const prices = [];
 
-  // --- JSON-LD for event metadata ---
+  // --- JSON-LD ---
   const jsonLdMatches = [...html.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
+  console.log('  JSON-LD blocks found:', jsonLdMatches.length);
   for (const match of jsonLdMatches) {
     try {
       const parsed = JSON.parse(match[1]);
       const items = Array.isArray(parsed) ? parsed : [parsed];
       for (const item of items) {
         if (!item || typeof item !== 'object') continue;
+        console.log('  JSON-LD @type:', item['@type']);
         if (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent') continue;
         if (!name && item.name && !item.name.toLowerCase().includes('tickets')) name = item.name;
         if (!date && item.startDate) date = normalizeDateString(item.startDate);
@@ -106,15 +108,15 @@ function extractFromHtml(html) {
           const state = item.location.address?.addressRegion || '';
           venue = [item.location.name, city, state].filter(Boolean).join(', ');
         }
-        if (name && date && venue) break;
+        console.log('  JSON-LD extracted -> name:', name, 'date:', date, 'venue:', venue);
       }
-    } catch(_) {}
-    if (name && date && venue) break;
+    } catch(e) { console.log('  JSON-LD parse error:', e.message); }
   }
 
-  // --- __NEXT_DATA__ for metadata fallback ---
+  // --- __NEXT_DATA__ ---
   if (!name || !date || !venue) {
     const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    console.log('  __NEXT_DATA__ found:', !!nextMatch);
     if (nextMatch) {
       try {
         const parsed = JSON.parse(nextMatch[1]);
@@ -134,11 +136,37 @@ function extractFromHtml(html) {
           for (const k of Object.keys(obj)) { if (obj[k] && typeof obj[k] === 'object') walk(obj[k]); }
         }
         walk(parsed);
-      } catch(_) {}
+        console.log('  NEXT_DATA extracted -> name:', name, 'date:', date, 'venue:', venue);
+      } catch(e) { console.log('  NEXT_DATA parse error:', e.message); }
     }
   }
 
-  // --- Listing count from regex patterns ---
+  // --- app-context fallback ---
+  if (!date || !venue) {
+    const appCtxMatch = html.match(/<script id="app-context"[^>]*>([\s\S]*?)<\/script>/i);
+    console.log('  app-context found:', !!appCtxMatch);
+    if (appCtxMatch) {
+      try {
+        const ctx = JSON.parse(appCtxMatch[1]);
+        if (!date && ctx.eventDate) date = normalizeDateString(ctx.eventDate);
+        if (!venue && ctx.venueName) venue = ctx.venueName;
+        if (!venue && ctx.venueConfigName) venue = ctx.venueConfigName;
+        console.log('  app-context extracted -> date:', date, 'venue:', venue);
+      } catch(e) { console.log('  app-context parse error:', e.message); }
+    }
+  }
+
+  // --- Raw regex fallbacks for date/venue ---
+  if (!date) {
+    const dateMatch = html.match(/"startDate"\s*:\s*"([^"]+)"/);
+    if (dateMatch) { date = normalizeDateString(dateMatch[1]); console.log('  Raw date match:', date); }
+  }
+  if (!venue) {
+    const venueMatch = html.match(/"venueName"\s*:\s*"([^"]+)"/);
+    if (venueMatch) { venue = venueMatch[1]; console.log('  Raw venue match:', venue); }
+  }
+
+  // --- Listing count ---
   const listingPatterns = [
     /(\d[\d,]+)\s+tickets?\s+from/gi,
     /(\d[\d,]+)\s+listings?/gi,
@@ -149,20 +177,14 @@ function extractFromHtml(html) {
   ];
   for (const pattern of listingPatterns) {
     const matches = [...html.matchAll(pattern)].map(m => parseInt(m[1].replace(/,/g,''), 10)).filter(v => v > 0);
-    if (matches.length) {
-      totalListings = Math.max(...matches);
-      console.log('  Listing count found: '+totalListings);
-      break;
-    }
+    if (matches.length) { totalListings = Math.max(...matches); break; }
   }
 
-  // --- Prices from $ text ---
+  // --- Prices ---
   for (const match of html.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
     const value = parseFloat(match[1].replace(/,/g,''));
     if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
   }
-
-  // --- Prices from JSON fields ---
   for (const match of html.matchAll(/"(?:currentPrice|listingPrice|pricePerTicket|minPrice|price|amount)"\s*:\s*([\d.]+)/g)) {
     const value = parseFloat(match[1]);
     if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
@@ -178,6 +200,7 @@ function extractFromHtml(html) {
   }
 
   prices.sort((a,b)=>a-b);
+  console.log('  Final: name='+name+' date='+date+' venue='+venue);
   console.log('  Parsed: listings='+totalListings+', prices='+prices.length+(prices.length ? ', floor=$'+Math.round(prices[0]) : ''));
   return { name, date, venue, totalListings, prices };
 }
@@ -202,7 +225,7 @@ async function scrapeEvent(event) {
     const summary = summarizePrices(prices);
     if (!summary.floor) { console.log('  No pricing for '+name); return null; }
 
-    console.log('  '+name+': '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg);
+    console.log('  Posting snapshot: name='+name+' date='+date+' venue='+venue);
 
     await postSnapshot({
       eventId, eventName:name, eventDate:date, venue, platform:'StubHub',

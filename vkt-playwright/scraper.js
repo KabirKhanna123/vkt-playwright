@@ -57,7 +57,6 @@ async function postSnapshot(payload) {
   } catch(e) { console.error('Snapshot error:', e.message); return false; }
 }
 
-// Fetch a URL through Decodo (returns HTML string)
 async function fetchWithDecodo(url) {
   try {
     const response = await fetch('https://scraper-api.decodo.com/v2/scrape', {
@@ -86,11 +85,10 @@ async function fetchWithDecodo(url) {
   }
 }
 
-// Fetch StubHub listings API directly through Decodo
 async function fetchListingsApi(eventId) {
   try {
-    // StubHub internal listings API - returns JSON with all listing data
     const apiUrl = `https://www.stubhub.com/api/search/catalog/listings/v3?eventId=${eventId}&quantity=1&pricingSummary=true&rows=250&start=0`;
+    console.log('  Listings API URL:', apiUrl);
     const response = await fetch('https://scraper-api.decodo.com/v2/scrape', {
       method: 'POST',
       headers: {
@@ -115,18 +113,20 @@ async function fetchListingsApi(eventId) {
     }
     const data = await response.json();
     const content = data?.results?.[0]?.content || data?.content || null;
+
+    // LOG RAW RESPONSE so we can see exactly what StubHub returns
+    console.log('  Listings API raw (first 1000):', String(content).slice(0, 1000));
+
     if (!content) return null;
 
-    // Parse the JSON response from StubHub's API
     let parsed;
     try { parsed = JSON.parse(content); } catch(_) {
-      // Sometimes content has HTML wrapper, try extracting JSON
       const jsonMatch = content.match(/\{[\s\S]*\}/);
       if (jsonMatch) { try { parsed = JSON.parse(jsonMatch[0]); } catch(_) {} }
     }
-    if (!parsed) { console.error('  Could not parse listings API response'); return null; }
+    if (!parsed) { console.error('  Could not parse listings API JSON'); return null; }
 
-    console.log('  Listings API keys:', Object.keys(parsed));
+    console.log('  Listings API top-level keys:', Object.keys(parsed));
     return parsed;
   } catch(e) {
     console.error('  Listings API error:', e.message);
@@ -183,7 +183,6 @@ function extractEventDetailsFromHtml(html) {
     }
   }
 
-  // Fallback: extract name from title tag
   if (!name) {
     const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
     if (titleMatch) {
@@ -198,7 +197,6 @@ function extractEventDetailsFromHtml(html) {
 function extractPricesFromListingsApi(apiData) {
   if (!apiData) return { totalListings: 0, prices: [] };
 
-  // Try different response shapes StubHub API might return
   const totalListings =
     apiData.totalListings ||
     apiData.numFound ||
@@ -208,7 +206,6 @@ function extractPricesFromListingsApi(apiData) {
 
   const prices = [];
 
-  // From pricingSummary if available
   if (apiData.pricingSummary) {
     const ps = apiData.pricingSummary;
     if (ps.minPrice) prices.push(safeNum(ps.minPrice));
@@ -216,7 +213,6 @@ function extractPricesFromListingsApi(apiData) {
     if (ps.avgPrice) prices.push(safeNum(ps.avgPrice));
   }
 
-  // From individual listings
   const listings = apiData.listing || apiData.listings || apiData.stubhubDocument?.listing || [];
   for (const l of listings) {
     const p = l.currentPrice?.amount || l.listingPrice?.amount || l.pricePerTicket || l.price;
@@ -226,7 +222,7 @@ function extractPricesFromListingsApi(apiData) {
     }
   }
 
-  console.log('  API: totalListings='+totalListings+', prices found='+prices.length);
+  console.log('  Extracted: totalListings='+totalListings+', prices found='+prices.length);
   return { totalListings, prices };
 }
 
@@ -235,7 +231,6 @@ async function scrapeEvent(event) {
   const originalName = event.name || 'Event '+eventId;
 
   try {
-    // Fetch event page for metadata
     const pageUrl = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
     console.log('  Fetching event page...');
     const html = await fetchWithDecodo(pageUrl);
@@ -248,7 +243,6 @@ async function scrapeEvent(event) {
     const date = details.date || event.date || null;
     console.log('  Event:', name, '|', date, '|', venue);
 
-    // Fetch listings via StubHub's internal API
     console.log('  Fetching listings API...');
     const listingsData = await fetchListingsApi(eventId);
     const { totalListings, prices } = extractPricesFromListingsApi(listingsData);

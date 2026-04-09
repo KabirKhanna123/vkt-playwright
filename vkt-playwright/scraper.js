@@ -22,8 +22,28 @@ async function dismissModals(page) {
   }
 }
 
+async function scrollToLoadListings(page) {
+  // Scroll down gradually to trigger lazy loading of listing cards
+  await page.evaluate(async () => {
+    await new Promise(resolve => {
+      let total = 0;
+      const distance = 400;
+      const delay = 300;
+      const timer = setInterval(() => {
+        window.scrollBy(0, distance);
+        total += distance;
+        if (total >= 5000) { clearInterval(timer); resolve(); }
+      }, delay);
+    });
+  });
+  await randomDelay(2000, 3000);
+  // Scroll back to top
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await randomDelay(500, 1000);
+}
+
 async function main() {
-  console.log('VKT debug: section extraction');
+  console.log('VKT debug: section extraction with scroll');
 
   const eventId = process.argv[2] || '160425611';
 
@@ -54,56 +74,48 @@ async function main() {
   const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
   console.log('Loading:', url);
   await page.goto(url, { waitUntil:'domcontentloaded', timeout:30000 });
-  await randomDelay(5000, 7000);
+  await randomDelay(4000, 5000);
   await dismissModals(page);
 
-  // Wait for listings to appear
-  try { await page.waitForSelector('text=/Section \\d+/i', { timeout:8000 }); } catch(_) { console.log('Selector wait timed out'); }
+  console.log('Scrolling to load listings...');
+  await scrollToLoadListings(page);
 
   const debug = await page.evaluate(() => {
-    const results = {
-      innerTextSample: [],
-      sectionMatches: [],
-      allTextWithSection: []
-    };
-
-    // 1. Scan innerText for "Section"
     const bodyText = document.body?.innerText || '';
     const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    for (const line of lines) {
-      if (/section/i.test(line)) {
-        results.allTextWithSection.push(line.slice(0, 100));
-      }
-    }
 
-    // 2. TreeWalker scan
+    const sectionLines = lines.filter(l => /section/i.test(l));
+    const first30Lines = lines.slice(0, 30);
+
+    // TreeWalker for section nodes
+    const sectionNodes = [];
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
       const text = node.textContent?.trim();
-      if (text && /section/i.test(text)) {
-        results.sectionMatches.push({
-          text: text.slice(0, 80),
+      if (text && /section/i.test(text) && text.length < 60) {
+        const style = window.getComputedStyle(node.parentElement);
+        sectionNodes.push({
+          text,
           tag: node.parentElement?.tagName,
-          visible: window.getComputedStyle(node.parentElement).display !== 'none'
+          visible: style.display !== 'none' && style.visibility !== 'hidden'
         });
       }
     }
 
-    // 3. Sample first 20 lines of innerText
-    results.innerTextSample = lines.slice(0, 20);
-
-    return results;
+    return { first30Lines, sectionLines: sectionLines.slice(0, 30), sectionNodes: sectionNodes.slice(0, 30) };
   });
 
-  console.log('\n--- innerText first 20 lines ---');
-  debug.innerTextSample.forEach(l => console.log(l));
+  console.log('\n--- First 30 lines of innerText ---');
+  debug.first30Lines.forEach(l => console.log(l));
 
-  console.log('\n--- All text containing "section" ---');
-  debug.allTextWithSection.slice(0, 30).forEach(l => console.log(l));
+  console.log('\n--- Lines containing "section" ---');
+  if (debug.sectionLines.length === 0) console.log('NONE FOUND');
+  debug.sectionLines.forEach(l => console.log(l));
 
-  console.log('\n--- TreeWalker nodes containing "section" ---');
-  debug.sectionMatches.slice(0, 20).forEach(m => console.log(m.tag, '|', m.visible, '|', m.text));
+  console.log('\n--- TreeWalker nodes with "section" ---');
+  if (debug.sectionNodes.length === 0) console.log('NONE FOUND');
+  debug.sectionNodes.forEach(m => console.log(m.tag+'|visible:'+m.visible+'|'+m.text));
 
   await browser.close();
 }

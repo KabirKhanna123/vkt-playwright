@@ -1,4 +1,4 @@
-const { chromium } = require('playwright');
+\const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
@@ -19,6 +19,25 @@ function sleep(ms) {
 function safeNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+function normalizeDateString(value) {
+  if (!value) return null;
+
+  const s = String(value).trim();
+
+  const isoMatch = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (isoMatch) return isoMatch[1];
+
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  return null;
 }
 
 function summarizePrices(prices) {
@@ -119,23 +138,39 @@ async function dismissModals(page) {
   }
 }
 
-async function extractJsonLdName(page) {
+async function extractStructuredEventData(page) {
   try {
     return await page.evaluate(() => {
-      const nodes = document.querySelectorAll('script[type="application/ld+json"]');
+      const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
 
-      for (const node of nodes) {
+      for (const script of scripts) {
         try {
-          const parsed = JSON.parse(node.textContent);
+          const parsed = JSON.parse(script.textContent);
 
-          if (Array.isArray(parsed)) {
-            for (const item of parsed) {
-              if (item && item.name && (item['@type'] === 'Event' || item['@type'] === 'SportsEvent')) {
-                return item.name;
-              }
+          const items = Array.isArray(parsed) ? parsed : [parsed];
+
+          for (const item of items) {
+            if (!item || typeof item !== 'object') continue;
+            if (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent') continue;
+
+            const venueObj = item.location?.name
+              ? item.location
+              : item.location?.address
+              ? item.location
+              : null;
+
+            let venue = null;
+            if (venueObj?.name) {
+              const city = venueObj.address?.addressLocality || '';
+              const state = venueObj.address?.addressRegion || '';
+              venue = [venueObj.name, city, state].filter(Boolean).join(', ');
             }
-          } else if (parsed && parsed.name && (parsed['@type'] === 'Event' || parsed['@type'] === 'SportsEvent')) {
-            return parsed.name;
+
+            return {
+              name: item.name || null,
+              date: item.startDate || null,
+              venue: venue || null
+            };
           }
         } catch (_) {}
       }
@@ -147,20 +182,95 @@ async function extractJsonLdName(page) {
   }
 }
 
-async function extractEventDateText(page) {
+async function extractMetaEventData(page) {
   try {
     return await page.evaluate(() => {
-      const timeEl = document.querySelector('time');
-      if (timeEl?.textContent?.trim()) return timeEl.textContent.trim();
+      const getMeta = (prop) => {
+        const el =
+          document.querySelector(`meta[property="${prop}"]`) ||
+          document.querySelector(`meta[name="${prop}"]`);
+        return el?.content?.trim() || null;
+      };
 
-      const testIdEl = document.querySelector('[data-testid="event-date"]');
-      if (testIdEl?.textContent?.trim()) return testIdEl.textContent.trim();
+      const title = getMeta('og:title') || document.title || null;
+      const description = getMeta('og:description') || getMeta('description') || null;
 
-      return null;
+      return { title, description };
     });
   } catch (_) {
-    return null;
+    return { title: null, description: null };
   }
+}
+
+async function extractEventPageDetails(page) {
+  const structured = await extractStructuredEventData(page);
+  const meta = await extractMetaEventData(page);
+
+  let name = structured?.name || null;
+  let venue = structured?.venue || null;
+  let date = normalizeDateString(structured?.date);
+
+  if (!name && meta?.title) {
+    const cleaned = meta.title
+      .replace(/\s*\|\s*StubHub.*$/i, '')
+      .replace(/\s*Tickets.*$/i, '')
+      .trim();
+    if (cleaned) name = cleaned;
+  }
+
+  if (!venue || !date) {
+    try {
+      const domData = await page.evaluate(() => {
+        const bodyText = document.body?.innerText || '';
+
+        let venueText = null;
+        let dateText = null;
+
+        const timeEl = document.querySelector('time');
+        if (timeEl?.getAttribute('datetime')) {
+          dateText = timeEl.getAttribute('datetime');
+        } else if (timeEl?.textContent?.trim()) {
+          dateText = timeEl.textContent.trim();
+        }
+
+        const venueCandidates = [
+          document.querySelector('[data-testid="event-venue"]'),
+          document.querySelector('[data-testid="venue-name"]'),
+          document.querySelector('[class*="venue"]')
+        ].filter(Boolean);
+
+        for (const el of venueCandidates) {
+          const txt = el.textContent?.trim();
+          if (txt && txt.length < 200) {
+            venueText = txt;
+            break;
+          }
+        }
+
+        if (!dateText) {
+          const match =
+            bodyText.match(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}\b/i) ||
+            bodyText.match(/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}\b/i);
+
+          if (match) dateText = match[0];
+        }
+
+        return {
+          venueText,
+          dateText
+        };
+      });
+
+      if (!venue && domData?.venueText) venue = domData.venueText;
+      if (!date && domData?.dateText) date = normalizeDateString(domData.dateText);
+    } catch (_) {}
+  }
+
+  return {
+    name: name || null,
+    venue: venue || null,
+    date: date || null
+  };
 }
 
 async function extractListingsAndPrices(page) {
@@ -297,10 +407,12 @@ async function scrapeEvent(page, event) {
     const baseUrl = await gotoEventPage(page, eventId);
     console.log(`  Opened ${baseUrl}`);
 
-    const betterName = await extractJsonLdName(page);
-    const eventDateText = await extractEventDateText(page);
+    const pageDetails = await extractEventPageDetails(page);
 
-    const name = betterName || originalName;
+    const name = pageDetails.name || originalName;
+    const stubhubVenue = pageDetails.venue || event.venue || null;
+    const stubhubDate = pageDetails.date || event.date || null;
+
     const { totalListings, prices } = await extractListingsAndPrices(page);
     const eventSummary = summarizePrices(prices);
 
@@ -312,11 +424,13 @@ async function scrapeEvent(page, event) {
     console.log(
       `  ✓ ${name}: listings=${totalListings}, floor=$${eventSummary.floor}, atp=$${eventSummary.avg}`
     );
+    console.log(`  ✓ Venue: ${stubhubVenue || 'N/A'} | Date: ${stubhubDate || 'N/A'}`);
 
     const eventPosted = await postSnapshot({
       eventId,
       eventName: name,
-      eventDate: eventDateText || event.date || null,
+      eventDate: stubhubDate,
+      venue: stubhubVenue,
       platform: 'StubHub',
       totalListings,
       section: null,
@@ -331,11 +445,20 @@ async function scrapeEvent(page, event) {
       console.log(`  ⚠ Event-level snapshot failed for ${eventId}`);
     }
 
-    if (betterName && betterName !== originalName) {
-      await supabase
+    const updates = {};
+    if (name && name !== originalName) updates.name = name;
+    if (stubhubVenue && stubhubVenue !== event.venue) updates.venue = stubhubVenue;
+    if (stubhubDate && stubhubDate !== event.date) updates.date = stubhubDate;
+
+    if (Object.keys(updates).length) {
+      const { error: updateError } = await supabase
         .from('events')
-        .update({ name: betterName })
+        .update(updates)
         .eq('id', eventId);
+
+      if (updateError) {
+        console.log(`  ⚠ Failed updating events table for ${eventId}: ${updateError.message}`);
+      }
     }
 
     const sectionIds = await getSectionIds(page);
@@ -352,7 +475,8 @@ async function scrapeEvent(page, event) {
       const ok = await postSnapshot({
         eventId,
         eventName: name,
-        eventDate: eventDateText || event.date || null,
+        eventDate: stubhubDate,
+        venue: stubhubVenue,
         platform: 'StubHub',
         totalListings,
         section: sectionData.section,
@@ -375,6 +499,8 @@ async function scrapeEvent(page, event) {
       ok: true,
       eventId,
       name,
+      venue: stubhubVenue,
+      date: stubhubDate,
       totalListings,
       sectionIds: sectionIds.length,
       postedSections

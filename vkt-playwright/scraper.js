@@ -100,52 +100,51 @@ async function extractPageData(page) {
       if (name && date && venue) break;
     }
 
-    // Listing count from page text
-    const bodyText = document.body?.innerText || '';
-    const listingMatches = [...bodyText.matchAll(/(\d[\d,]*)\s+listings?/gi)]
-      .map(m => parseInt(m[1].replace(/,/g,''), 10))
-      .filter(v => Number.isFinite(v) && v >= 0);
-    const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
-
-    // Prices from visible text
+    // Scan ALL text nodes for listing count, prices, and section names
+    const sectionNames = new Set();
     const prices = [];
+    let totalListings = 0;
+
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
       if (!node.parentElement) continue;
       if (node.parentElement.closest('script,style,noscript,svg')) continue;
       const style = window.getComputedStyle(node.parentElement);
-      if (style.display==='none' || style.visibility==='hidden') continue;
-      for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      const text = node.textContent.trim();
+      if (!text) continue;
+
+      // Listing count
+      const listingMatch = text.match(/^(\d[\d,]*)\s+listings?$/i);
+      if (listingMatch) {
+        const n = parseInt(listingMatch[1].replace(/,/g,''), 10);
+        if (n > totalListings) totalListings = n;
+      }
+
+      // Prices
+      for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
         const value = parseFloat(match[1].replace(/,/g,''));
         if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
       }
-    }
-    prices.sort((a,b)=>a-b);
 
-    // Extract real section names from listing cards
-    const sectionNames = new Set();
-    // Method 1: look for "Section X" text in listing cards
-    const allText = document.querySelectorAll('*');
-    for (const el of allText) {
-      if (el.children.length > 0) continue; // leaf nodes only
-      const text = el.textContent?.trim();
-      if (!text) continue;
-      // Match "Section 112", "Section A", "Field Level", "Lower Bowl", "Upper Deck" etc
-      const secMatch = text.match(/^(Section\s+[\w\d]+|[A-Z][a-z]+\s+(?:Level|Bowl|Deck|Box|Club|Field|End Zone|Corner|Loge|Mezzanine|Suite|Row\s+\w+))$/i);
-      if (secMatch) sectionNames.add(secMatch[1].trim());
-    }
-
-    // Method 2: look for section headings in listing card structure
-    const sectionEls = document.querySelectorAll('[class*="section"],[data-section],[data-testid*="section"]');
-    for (const el of sectionEls) {
-      const text = el.textContent?.trim();
-      if (text && text.length < 50 && /section/i.test(text)) {
-        const clean = text.replace(/\s+/g, ' ').trim();
-        if (clean) sectionNames.add(clean);
+      // Section names — match "Section 112", "Section A3", "Section GA" etc
+      const secMatch = text.match(/^(Section\s+[A-Z0-9]{1,6})$/i);
+      if (secMatch) {
+        sectionNames.add(secMatch[1].trim());
       }
     }
 
+    // Also scan innerText of body for listing count fallback
+    if (!totalListings) {
+      const bodyText = document.body?.innerText || '';
+      const matches = [...bodyText.matchAll(/(\d[\d,]*)\s+listings?/gi)]
+        .map(m => parseInt(m[1].replace(/,/g,''), 10))
+        .filter(v => Number.isFinite(v) && v > 0);
+      if (matches.length) totalListings = Math.max(...matches);
+    }
+
+    prices.sort((a,b)=>a-b);
     return { name, date, venue, totalListings, prices, sectionNames: Array.from(sectionNames) };
   });
 }
@@ -223,30 +222,21 @@ async function scrapeEvent(page, event) {
 
     // Section scraping for major events
     if (isMajor) {
-      console.log('  Section names found: '+sectionNames.length);
-      if (sectionNames.length === 0) {
-        console.log('  No section names found in listing cards');
-      } else {
+      console.log('  Section names found: '+sectionNames.length+' — '+sectionNames.slice(0,5).join(', ')+(sectionNames.length > 5 ? '...' : ''));
+      if (sectionNames.length > 0) {
         let postedSections = 0;
         for (const sectionName of sectionNames) {
           try {
-            // Encode section name for URL
             const encoded = encodeURIComponent(sectionName);
             const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${encoded}&quantity=0`;
             await navigateTo(page, secUrl, SECTION_DELAY_MS);
             const secData = await extractSectionPrices(page);
 
             const secTotal = secData.totalListings;
-            if (!secTotal || secTotal === totalListings) {
-              await randomDelay(500, 1000);
-              continue;
-            }
+            if (!secTotal || secTotal === totalListings) continue;
 
             const secSummary = summarizePrices(secData.prices);
-            if (!secSummary.floor) {
-              await randomDelay(500, 1000);
-              continue;
-            }
+            if (!secSummary.floor) continue;
 
             const ok = await postSnapshot({
               eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
@@ -265,6 +255,8 @@ async function scrapeEvent(page, event) {
           } catch(e) { console.error('    Section "'+sectionName+'" failed:', e.message); continue; }
         }
         console.log('  Sections: '+postedSections+'/'+sectionNames.length+' posted');
+      } else {
+        console.log('  No section names found — page may not have loaded fully');
       }
     }
 
@@ -317,7 +309,6 @@ async function main() {
 
   const page = await context.newPage();
 
-  // Warm up with google visit
   try {
     await page.goto('https://www.google.com', { waitUntil:'domcontentloaded', timeout:10000 });
     await randomDelay(1500, 3000);

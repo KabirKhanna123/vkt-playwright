@@ -12,7 +12,6 @@ const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-
 function safeNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
 function normalizeDateString(value) {
@@ -74,7 +73,7 @@ async function fetchWithDecodo(url) {
       })
     });
     if (!response.ok) {
-      console.error('  Decodo API error:', response.status, await response.text());
+      console.error('  Decodo error:', response.status, await response.text());
       return null;
     }
     const data = await response.json();
@@ -85,58 +84,12 @@ async function fetchWithDecodo(url) {
   }
 }
 
-async function fetchListingsApi(eventId) {
-  try {
-    const apiUrl = `https://www.stubhub.com/api/search/catalog/listings/v3?eventId=${eventId}&quantity=1&pricingSummary=true&rows=250&start=0`;
-    console.log('  Listings API URL:', apiUrl);
-    const response = await fetch('https://scraper-api.decodo.com/v2/scrape', {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Authorization': 'Basic ' + DECODO_TOKEN,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        url: apiUrl,
-        proxy_pool: 'premium',
-        headless: 'html',
-        headers: {
-          'Accept': 'application/json',
-          'Referer': `https://www.stubhub.com/event/${eventId}/`,
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
-      })
-    });
-    if (!response.ok) {
-      console.error('  Listings API Decodo error:', response.status);
-      return null;
-    }
-    const data = await response.json();
-    const content = data?.results?.[0]?.content || data?.content || null;
-
-    // LOG RAW RESPONSE so we can see exactly what StubHub returns
-    console.log('  Listings API raw (first 1000):', String(content).slice(0, 1000));
-
-    if (!content) return null;
-
-    let parsed;
-    try { parsed = JSON.parse(content); } catch(_) {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) { try { parsed = JSON.parse(jsonMatch[0]); } catch(_) {} }
-    }
-    if (!parsed) { console.error('  Could not parse listings API JSON'); return null; }
-
-    console.log('  Listings API top-level keys:', Object.keys(parsed));
-    return parsed;
-  } catch(e) {
-    console.error('  Listings API error:', e.message);
-    return null;
-  }
-}
-
-function extractEventDetailsFromHtml(html) {
+function extractFromHtml(html) {
   let name = null, date = null, venue = null;
+  let totalListings = 0;
+  const prices = [];
 
+  // --- Event metadata from JSON-LD ---
   const jsonLdMatches = [...html.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
   for (const match of jsonLdMatches) {
     try {
@@ -158,72 +111,68 @@ function extractEventDetailsFromHtml(html) {
     if (name && date && venue) break;
   }
 
-  if (!name || !date || !venue) {
-    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
-    if (nextMatch) {
-      try {
-        const parsed = JSON.parse(nextMatch[1]);
-        function walk(obj) {
-          if (!obj || typeof obj !== 'object') return;
-          if (!name && typeof obj.name === 'string' && !obj.name.toLowerCase().includes('tickets') && obj.name.length < 200) name = obj.name.trim();
-          if (!date && typeof obj.startDate === 'string') date = normalizeDateString(obj.startDate);
-          if (!date && typeof obj.date === 'string') date = normalizeDateString(obj.date);
-          if (!venue) {
-            if (typeof obj.venueName === 'string') venue = obj.venueName.trim();
-            else if (obj.venue && typeof obj.venue.name === 'string') {
-              const city = obj.venue.city?.name || obj.venue.city || '';
-              const state = obj.venue.state?.stateCode || obj.venue.state || '';
-              venue = [obj.venue.name, city, state].filter(Boolean).join(', ');
-            } else if (typeof obj.locationName === 'string') venue = obj.locationName.trim();
+  // --- Walk all embedded JSON blobs for listing count + prices ---
+  const scriptMatches = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const match of scriptMatches) {
+    const content = match[1].trim();
+    if (!content.startsWith('{') && !content.startsWith('[')) continue;
+    try {
+      const parsed = JSON.parse(content);
+      function walk(obj) {
+        if (!obj || typeof obj !== 'object') return;
+        // Listing count candidates
+        if (!totalListings) {
+          const candidates = ['totalListings', 'listingCount', 'numListings', 'totalTickets', 'numFound', 'ticketCount'];
+          for (const key of candidates) {
+            if (typeof obj[key] === 'number' && obj[key] > 0) {
+              totalListings = obj[key];
+              console.log('  Found listing count via key "'+key+'": '+totalListings);
+              break;
+            }
           }
-          for (const key of Object.keys(obj)) { const val = obj[key]; if (val && typeof val === 'object') walk(val); }
         }
-        walk(parsed);
-      } catch(_) {}
+        // Price candidates
+        const priceKeys = ['currentPrice', 'listingPrice', 'pricePerTicket', 'minPrice', 'maxPrice', 'price', 'amount'];
+        for (const key of priceKeys) {
+          if (typeof obj[key] === 'number' && obj[key] > 0 && obj[key] < 25000) prices.push(obj[key]);
+          if (obj[key] && typeof obj[key] === 'object' && typeof obj[key].amount === 'number') prices.push(obj[key].amount);
+        }
+        for (const k of Object.keys(obj)) {
+          if (obj[k] && typeof obj[k] === 'object') walk(obj[k]);
+        }
+      }
+      walk(parsed);
+    } catch(_) {}
+  }
+
+  // --- Fallback: listing count from page text ---
+  if (!totalListings) {
+    const listingMatches = [...html.matchAll(/(\d[\d,]*)\s+listings?/gi)]
+      .map(m => parseInt(m[1].replace(/,/g,''), 10))
+      .filter(v => Number.isFinite(v) && v > 0);
+    if (listingMatches.length) totalListings = Math.max(...listingMatches);
+  }
+
+  // --- Fallback: prices from visible $ text ---
+  if (!prices.length) {
+    for (const match of html.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+      const value = parseFloat(match[1].replace(/,/g,''));
+      if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
     }
   }
 
+  // --- Fallback: name from title tag ---
   if (!name) {
     const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
     if (titleMatch) {
-      let t = titleMatch[1].replace(/\s*[-–|].*?(StubHub|Tickets).*$/i, '').trim();
+      let t = titleMatch[1].replace(/\s*tickets\s*[-–|].*$/i, '').replace(/\s*[-–|].*$/i, '').trim();
       if (t && !t.toLowerCase().includes('tickets')) name = t;
     }
   }
 
-  return { name: name||null, date: date||null, venue: venue||null };
-}
-
-function extractPricesFromListingsApi(apiData) {
-  if (!apiData) return { totalListings: 0, prices: [] };
-
-  const totalListings =
-    apiData.totalListings ||
-    apiData.numFound ||
-    apiData.total ||
-    apiData.listings?.length ||
-    0;
-
-  const prices = [];
-
-  if (apiData.pricingSummary) {
-    const ps = apiData.pricingSummary;
-    if (ps.minPrice) prices.push(safeNum(ps.minPrice));
-    if (ps.maxPrice) prices.push(safeNum(ps.maxPrice));
-    if (ps.avgPrice) prices.push(safeNum(ps.avgPrice));
-  }
-
-  const listings = apiData.listing || apiData.listings || apiData.stubhubDocument?.listing || [];
-  for (const l of listings) {
-    const p = l.currentPrice?.amount || l.listingPrice?.amount || l.pricePerTicket || l.price;
-    if (p) {
-      const val = safeNum(p);
-      if (val > 0 && val < 25000) prices.push(val);
-    }
-  }
-
-  console.log('  Extracted: totalListings='+totalListings+', prices found='+prices.length);
-  return { totalListings, prices };
+  prices.sort((a,b)=>a-b);
+  console.log('  Parsed: listings='+totalListings+', prices='+prices.length+(prices.length ? ', floor=$'+Math.round(prices[0]) : ''));
+  return { name, date, venue, totalListings, prices };
 }
 
 async function scrapeEvent(event) {
@@ -231,24 +180,20 @@ async function scrapeEvent(event) {
   const originalName = event.name || 'Event '+eventId;
 
   try {
-    const pageUrl = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
-    console.log('  Fetching event page...');
-    const html = await fetchWithDecodo(pageUrl);
-    if (!html) { console.error('  No HTML returned for', eventId); return null; }
+    const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
+    console.log('  Fetching:', url);
+    const html = await fetchWithDecodo(url);
+    if (!html) { console.error('  No HTML for', eventId); return null; }
 
-    const details = extractEventDetailsFromHtml(html);
-    let name = details.name || originalName;
+    const { name: parsedName, date: parsedDate, venue: parsedVenue, totalListings, prices } = extractFromHtml(html);
+
+    let name = parsedName || originalName;
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
-    const venue = details.venue || event.venue || null;
-    const date = details.date || event.date || null;
-    console.log('  Event:', name, '|', date, '|', venue);
+    const venue = parsedVenue || event.venue || null;
+    const date = parsedDate || event.date || null;
 
-    console.log('  Fetching listings API...');
-    const listingsData = await fetchListingsApi(eventId);
-    const { totalListings, prices } = extractPricesFromListingsApi(listingsData);
     const summary = summarizePrices(prices);
-
-    if (!summary.floor) { console.log('  No pricing data for '+name); return null; }
+    if (!summary.floor) { console.log('  No pricing for '+name); return null; }
 
     console.log('  '+name+': '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg);
 

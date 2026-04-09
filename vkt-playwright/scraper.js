@@ -6,6 +6,7 @@ const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
 const DECODO_TOKEN = process.env.DECODO_TOKEN || 'VTAwMDAzODg2OTg6UFdfMWQxMWYxY2ZlNTZhNWY2MzQ1YWVkMjUzZGUzNjI4MjA3';
 
 const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '5000', 10);
+const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '2000', 10);
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
 const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 const MIN_HTML_LENGTH = 100000;
@@ -38,7 +39,12 @@ function summarizePrices(prices) {
 }
 
 async function getEvents() {
-  const { data, error } = await supabase.from('events').select('id,name,date,venue,platform').not('id','like','tm_%').order('date',{ascending:true}).limit(EVENT_LIMIT);
+  const { data, error } = await supabase
+    .from('events')
+    .select('id,name,date,venue,platform,is_major')
+    .not('id','like','tm_%')
+    .order('date',{ascending:true})
+    .limit(EVENT_LIMIT);
   if (error) { console.error('Failed to fetch events:', error.message); return []; }
   return data || [];
 }
@@ -52,9 +58,9 @@ async function scrapedRecently(eventId, hours=RECENT_HOURS) {
 async function postSnapshot(payload) {
   try {
     const r = await fetch(VKT_API+'/api/snapshot', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
-    if (!r.ok) { console.error('Snapshot failed:', r.status, await r.text()); return false; }
+    if (!r.ok) { console.error('  Snapshot failed:', r.status, await r.text()); return false; }
     return true;
-  } catch(e) { console.error('Snapshot error:', e.message); return false; }
+  } catch(e) { console.error('  Snapshot error:', e.message); return false; }
 }
 
 async function fetchWithDecodo(url) {
@@ -77,9 +83,7 @@ async function fetchWithDecodo(url) {
       return null;
     }
     const data = await response.json();
-    const html = data?.results?.[0]?.content || data?.content || data?.html || null;
-    if (html) console.log('  HTML length:', html.length);
-    return html;
+    return data?.results?.[0]?.content || data?.content || data?.html || null;
   } catch(e) {
     console.error('  Decodo fetch error:', e.message);
     return null;
@@ -154,12 +158,12 @@ function extractFromHtml(html) {
 
   // --- Raw regex fallbacks ---
   if (!date) {
-    const dateMatch = html.match(/"startDate"\s*:\s*"([^"]+)"/);
-    if (dateMatch) date = normalizeDateString(dateMatch[1]);
+    const m = html.match(/"startDate"\s*:\s*"([^"]+)"/);
+    if (m) date = normalizeDateString(m[1]);
   }
   if (!venue) {
-    const venueMatch = html.match(/"venueName"\s*:\s*"([^"]+)"/);
-    if (venueMatch) venue = venueMatch[1];
+    const m = html.match(/"venueName"\s*:\s*"([^"]+)"/);
+    if (m) venue = m[1];
   }
 
   // --- Title fallback for name ---
@@ -199,16 +203,118 @@ function extractFromHtml(html) {
   return { name, date, venue, totalListings, prices };
 }
 
+// Extract section IDs and names from HTML
+function extractSections(html) {
+  const sections = [];
+  const seen = new Set();
+
+  // Method 1: sprite-identifier attributes in SVG map
+  for (const match of html.matchAll(/sprite-identifier="s(\d+)"[^>]*(?:aria-label|title)="([^"]+)"/g)) {
+    const id = match[1];
+    const label = match[2].trim();
+    if (!seen.has(id)) { seen.add(id); sections.push({ id, name: label }); }
+  }
+  for (const match of html.matchAll(/(?:aria-label|title)="([^"]+)"[^>]*sprite-identifier="s(\d+)"/g)) {
+    const id = match[2];
+    const label = match[1].trim();
+    if (!seen.has(id)) { seen.add(id); sections.push({ id, name: label }); }
+  }
+
+  // Method 2: embedded JSON section data
+  const sectionJsonMatches = [...html.matchAll(/"sectionId"\s*:\s*"?(\d+)"?[^}]*"sectionName"\s*:\s*"([^"]+)"/g)];
+  for (const match of sectionJsonMatches) {
+    const id = match[1];
+    const name = match[2].trim();
+    if (!seen.has(id)) { seen.add(id); sections.push({ id, name }); }
+  }
+  // Also try reversed order
+  const sectionJsonMatches2 = [...html.matchAll(/"sectionName"\s*:\s*"([^"]+)"[^}]*"sectionId"\s*:\s*"?(\d+)"?/g)];
+  for (const match of sectionJsonMatches2) {
+    const id = match[2];
+    const name = match[1].trim();
+    if (!seen.has(id)) { seen.add(id); sections.push({ id, name }); }
+  }
+
+  // Method 3: sprite-identifier only (no name available, use ID as name)
+  if (sections.length === 0) {
+    for (const match of html.matchAll(/sprite-identifier="s(\d+)"/g)) {
+      const id = match[1];
+      if (!seen.has(id)) { seen.add(id); sections.push({ id, name: 'Section '+id }); }
+    }
+  }
+
+  console.log('  Sections found:', sections.length);
+  return sections;
+}
+
+async function scrapeSections(eventId, eventName, eventDate, venue, eventSummary, sections, totalListings) {
+  let posted = 0;
+  for (const section of sections) {
+    try {
+      const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${section.id}&quantity=0`;
+      const html = await fetchWithDecodo(secUrl);
+      if (!html || html.length < MIN_HTML_LENGTH) {
+        await sleep(SECTION_DELAY_MS);
+        continue;
+      }
+
+      const { totalListings: secTotal, prices: secPrices } = extractFromHtml(html);
+
+      // Skip if no listings or same as event total (section filter didn't work)
+      if (!secTotal || secTotal === totalListings) {
+        await sleep(SECTION_DELAY_MS);
+        continue;
+      }
+
+      const secSummary = summarizePrices(secPrices);
+      if (!secSummary.floor) {
+        await sleep(SECTION_DELAY_MS);
+        continue;
+      }
+
+      const ok = await postSnapshot({
+        eventId,
+        eventName,
+        eventDate,
+        venue,
+        platform: 'StubHub',
+        totalListings: 0,
+        section: section.name,
+        sectionListings: secTotal,
+        sectionFloor: secSummary.floor,
+        sectionAvg: secSummary.avg,
+        sectionCeiling: secSummary.ceiling,
+        eventFloor: eventSummary.floor,
+        eventAvg: eventSummary.avg,
+        eventCeiling: eventSummary.ceiling,
+        source: 'decodo'
+      });
+
+      if (ok) {
+        posted++;
+        console.log('    Section '+section.name+': '+secTotal+' listings, floor $'+secSummary.floor);
+      }
+
+      await sleep(SECTION_DELAY_MS);
+    } catch(e) {
+      console.error('    Section '+section.name+' failed:', e.message);
+      continue;
+    }
+  }
+  console.log('  Sections posted: '+posted+'/'+sections.length);
+  return posted;
+}
+
 async function scrapeEvent(event) {
   const eventId = event.id;
   const originalName = event.name || 'Event '+eventId;
+  const isMajor = event.is_major === true;
 
   try {
     const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
     const html = await fetchWithDecodo(url);
     if (!html) { console.error('  No HTML for', eventId); return null; }
 
-    // Skip bot-challenge pages (too small to be real)
     if (html.length < MIN_HTML_LENGTH) {
       console.log('  Skipping '+eventId+' — HTML too small ('+html.length+'), likely bot challenge');
       return null;
@@ -225,7 +331,7 @@ async function scrapeEvent(event) {
     if (!summary.floor) { console.log('  No pricing for '+name); return null; }
 
     console.log('  '+name+' | '+date+' | '+venue);
-    console.log('  '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg);
+    console.log('  '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg+(isMajor ? ' [MAJOR]' : ''));
 
     await postSnapshot({
       eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
@@ -240,6 +346,17 @@ async function scrapeEvent(event) {
     if (date && date !== event.date) updates.date = date;
     if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id',eventId);
 
+    // Section scraping for major events
+    if (isMajor) {
+      console.log('  Extracting sections...');
+      const sections = extractSections(html);
+      if (sections.length > 0) {
+        await scrapeSections(eventId, name, date, venue, summary, sections, totalListings);
+      } else {
+        console.log('  No sections found in HTML for major event — may need map interaction');
+      }
+    }
+
     return { ok:true };
 
   } catch(e) { console.error('  Failed '+eventId+':', e.message); return null; }
@@ -249,7 +366,7 @@ async function main() {
   console.log('VKT Playwright scraper starting...');
 
   const manualId = process.argv[2];
-  let events = manualId ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub' }] : await getEvents();
+  let events = manualId ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:true }] : await getEvents();
   console.log('Events to process: '+events.length);
 
   let scraped=0, skipped=0, failed=0;

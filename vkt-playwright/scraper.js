@@ -138,7 +138,7 @@ async function dismissModals(page) {
   }
 }
 
-async function extractStructuredEventData(page) {
+async function extractJsonLdEvent(page) {
   try {
     return await page.evaluate(() => {
       const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
@@ -152,17 +152,13 @@ async function extractStructuredEventData(page) {
             if (!item || typeof item !== 'object') continue;
             if (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent') continue;
 
-            const venueObj = item.location?.name
-              ? item.location
-              : item.location?.address
-              ? item.location
-              : null;
-
             let venue = null;
-            if (venueObj?.name) {
-              const city = venueObj.address?.addressLocality || '';
-              const state = venueObj.address?.addressRegion || '';
-              venue = [venueObj.name, city, state].filter(Boolean).join(', ');
+            const location = item.location || null;
+
+            if (location?.name) {
+              const city = location.address?.addressLocality || '';
+              const state = location.address?.addressRegion || '';
+              venue = [location.name, city, state].filter(Boolean).join(', ');
             }
 
             return {
@@ -181,131 +177,146 @@ async function extractStructuredEventData(page) {
   }
 }
 
-async function extractMetaEventData(page) {
+async function extractNextDataEvent(page) {
   try {
     return await page.evaluate(() => {
-      const getMeta = (prop) => {
-        const el =
-          document.querySelector(`meta[property="${prop}"]`) ||
-          document.querySelector(`meta[name="${prop}"]`);
-        return el?.content?.trim() || null;
-      };
+      const el = document.querySelector('#__NEXT_DATA__');
+      if (!el?.textContent) return null;
 
-      const title = getMeta('og:title') || document.title || null;
-      const description = getMeta('og:description') || getMeta('description') || null;
-
-      return { title, description };
-    });
-  } catch (_) {
-    return { title: null, description: null };
-  }
-}
-
-async function extractBestEventName(page) {
-  try {
-    return await page.evaluate(() => {
-      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-
-      for (const script of scripts) {
-        try {
-          const data = JSON.parse(script.textContent);
-          const items = Array.isArray(data) ? data : [data];
-
-          for (const item of items) {
-            if (
-              item &&
-              (item['@type'] === 'Event' || item['@type'] === 'SportsEvent') &&
-              item.name &&
-              !String(item.name).toLowerCase().includes('tickets')
-            ) {
-              return String(item.name).trim();
-            }
-          }
-        } catch (_) {}
+      let parsed;
+      try {
+        parsed = JSON.parse(el.textContent);
+      } catch (_) {
+        return null;
       }
 
-      const h1 = document.querySelector('h1');
-      if (h1?.textContent) {
-        const txt = h1.textContent.trim();
-        if (txt && !txt.toLowerCase().includes('tickets')) {
-          return txt;
+      let best = {
+        name: null,
+        date: null,
+        venue: null
+      };
+
+      function walk(obj) {
+        if (!obj || typeof obj !== 'object') return;
+
+        if (!best.name && typeof obj.name === 'string' && !obj.name.toLowerCase().includes('tickets') && obj.name.length < 200) {
+          best.name = obj.name.trim();
+        }
+
+        if (!best.date && typeof obj.startDate === 'string') {
+          best.date = obj.startDate;
+        }
+
+        if (!best.date && typeof obj.date === 'string') {
+          best.date = obj.date;
+        }
+
+        if (!best.venue) {
+          if (typeof obj.venueName === 'string') {
+            best.venue = obj.venueName.trim();
+          } else if (obj.venue && typeof obj.venue.name === 'string') {
+            const city = obj.venue.city?.name || obj.venue.city || '';
+            const state = obj.venue.state?.stateCode || obj.venue.state || '';
+            best.venue = [obj.venue.name, city, state].filter(Boolean).join(', ');
+          } else if (typeof obj.locationName === 'string') {
+            best.venue = obj.locationName.trim();
+          }
+        }
+
+        for (const key of Object.keys(obj)) {
+          const val = obj[key];
+          if (val && typeof val === 'object') {
+            walk(val);
+          }
         }
       }
 
-      let title = document.title || '';
-      title = title.replace(/\s*\|\s*StubHub.*$/i, '');
-      title = title.replace(/\s*Tickets.*$/i, '');
-      title = title.trim();
-
-      return title || null;
+      walk(parsed);
+      return best;
     });
   } catch (_) {
     return null;
   }
 }
 
-async function extractEventPageDetails(page) {
-  const structured = await extractStructuredEventData(page);
-  const meta = await extractMetaEventData(page);
+async function extractVisibleEventData(page) {
+  try {
+    return await page.evaluate(() => {
+      const bodyText = document.body?.innerText || '';
 
-  let name = structured?.name || null;
-  let venue = structured?.venue || null;
-  let date = normalizeDateString(structured?.date);
+      let name = null;
+      let venue = null;
+      let date = null;
 
-  if (!name && meta?.title) {
-    const cleaned = meta.title
-      .replace(/\s*\|\s*StubHub.*$/i, '')
-      .replace(/\s*Tickets.*$/i, '')
-      .trim();
-    if (cleaned) name = cleaned;
+      const h1 = document.querySelector('h1');
+      if (h1?.textContent?.trim()) {
+        const txt = h1.textContent.trim();
+        if (!txt.toLowerCase().includes('tickets')) {
+          name = txt;
+        }
+      }
+
+      const timeEl = document.querySelector('time');
+      if (timeEl?.getAttribute('datetime')) {
+        date = timeEl.getAttribute('datetime');
+      } else if (timeEl?.textContent?.trim()) {
+        date = timeEl.textContent.trim();
+      }
+
+      const venueCandidates = [
+        document.querySelector('[data-testid="event-venue"]'),
+        document.querySelector('[data-testid="venue-name"]'),
+        document.querySelector('[class*="venue"]')
+      ].filter(Boolean);
+
+      for (const el of venueCandidates) {
+        const txt = el.textContent?.trim();
+        if (txt && txt.length < 200) {
+          venue = txt;
+          break;
+        }
+      }
+
+      if (!date) {
+        const match =
+          bodyText.match(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}\b/i) ||
+          bodyText.match(/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}\b/i);
+
+        if (match) date = match[0];
+      }
+
+      return { name, venue, date };
+    });
+  } catch (_) {
+    return { name: null, venue: null, date: null };
   }
+}
 
-  if (!venue || !date) {
-    try {
-      const domData = await page.evaluate(() => {
-        const bodyText = document.body?.innerText || '';
+async function extractEventPageDetails(page) {
+  const jsonLd = await extractJsonLdEvent(page);
+  const nextData = await extractNextDataEvent(page);
+  const visible = await extractVisibleEventData(page);
 
-        let venueText = null;
-        let dateText = null;
+  let name =
+    jsonLd?.name ||
+    nextData?.name ||
+    visible?.name ||
+    null;
 
-        const timeEl = document.querySelector('time');
-        if (timeEl?.getAttribute('datetime')) {
-          dateText = timeEl.getAttribute('datetime');
-        } else if (timeEl?.textContent?.trim()) {
-          dateText = timeEl.textContent.trim();
-        }
+  let venue =
+    jsonLd?.venue ||
+    nextData?.venue ||
+    visible?.venue ||
+    null;
 
-        const venueCandidates = [
-          document.querySelector('[data-testid="event-venue"]'),
-          document.querySelector('[data-testid="venue-name"]'),
-          document.querySelector('[class*="venue"]')
-        ].filter(Boolean);
+  let date =
+    normalizeDateString(jsonLd?.date) ||
+    normalizeDateString(nextData?.date) ||
+    normalizeDateString(visible?.date) ||
+    null;
 
-        for (const el of venueCandidates) {
-          const txt = el.textContent?.trim();
-          if (txt && txt.length < 200) {
-            venueText = txt;
-            break;
-          }
-        }
-
-        if (!dateText) {
-          const match =
-            bodyText.match(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}\b/i) ||
-            bodyText.match(/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}\b/i);
-
-          if (match) dateText = match[0];
-        }
-
-        return {
-          venueText,
-          dateText
-        };
-      });
-
-      if (!venue && domData?.venueText) venue = domData.venueText;
-      if (!date && domData?.dateText) date = normalizeDateString(domData.dateText);
-    } catch (_) {}
+  if (name && name.toLowerCase().includes('tickets')) {
+    name = visible?.name || null;
   }
 
   return {
@@ -428,9 +439,15 @@ async function scrapeSection(page, eventId, sectionId, fallbackName) {
       return null;
     }
 
+    const derivedListings = prices.length || 0;
+    const finalSectionListings =
+      totalListings && totalListings > 0 && totalListings !== 1
+        ? totalListings
+        : derivedListings;
+
     return {
       section: fallbackName || `Section ${sectionId}`,
-      sectionListings: totalListings || 0,
+      sectionListings: finalSectionListings,
       sectionFloor: summary.floor,
       sectionAvg: summary.avg,
       sectionCeiling: summary.ceiling
@@ -450,12 +467,10 @@ async function scrapeEvent(page, event) {
     console.log(`  Opened ${baseUrl}`);
 
     const pageDetails = await extractEventPageDetails(page);
-    const betterName = await extractBestEventName(page);
 
-    let name = betterName || pageDetails.name || originalName;
-
+    let name = pageDetails.name || originalName;
     if (name && name.toLowerCase().includes('tickets')) {
-      name = pageDetails.name || originalName;
+      name = originalName;
     }
 
     const stubhubVenue = pageDetails.venue || event.venue || null;
@@ -533,6 +548,8 @@ async function scrapeEvent(page, event) {
         sectionAvg: sectionData.sectionAvg,
         sectionCeiling: sectionData.sectionCeiling,
         eventFloor: eventSummary.floor,
+        eventAvg: eventSummary.avg,
+        eventCeiling: eventSummary.ceiling,
         source: 'playwright-url'
       });
 

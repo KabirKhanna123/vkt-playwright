@@ -1,9 +1,9 @@
 {
   "name": "vkt-playwright-scraper",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "scraper.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node scraper.js",
     "seed": "node seeder.js",
     "scrape": "node scraper.js"
   },

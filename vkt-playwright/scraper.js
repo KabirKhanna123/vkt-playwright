@@ -30,7 +30,11 @@ function normalizeDateString(value) {
 function summarizePrices(prices) {
   const valid = (prices||[]).map(safeNum).filter(v => v>0 && v<25000).sort((a,b)=>a-b);
   if (!valid.length) return { floor:null, avg:null, ceiling:null };
-  return { floor:valid[0], avg:Math.round(valid.reduce((a,b)=>a+b,0)/valid.length), ceiling:valid[valid.length-1] };
+  return {
+    floor: Math.round(valid[0]),
+    avg: Math.round(valid.reduce((a,b)=>a+b,0)/valid.length),
+    ceiling: Math.round(valid[valid.length-1])
+  };
 }
 
 async function getEvents() {
@@ -67,7 +71,8 @@ async function fetchWithDecodo(url) {
         url: url,
         proxy_pool: 'premium',
         headless: 'html',
-        wait_for_selector: 'body'
+        wait_for_selector: 'body',
+        wait: 5000
       })
     });
     if (!response.ok) {
@@ -76,7 +81,6 @@ async function fetchWithDecodo(url) {
       return null;
     }
     const data = await response.json();
-    console.log('  Decodo response keys:', Object.keys(data));
     const html = data?.results?.[0]?.content || data?.content || data?.html || null;
     if (!html) { console.error('  Decodo empty HTML. Full response:', JSON.stringify(data).slice(0,500)); }
     return html;
@@ -104,7 +108,6 @@ function extractListingsAndPricesFromHtml(html) {
 function extractEventDetailsFromHtml(html) {
   let name = null, date = null, venue = null;
 
-  // Try JSON-LD
   const jsonLdMatches = [...html.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
   for (const match of jsonLdMatches) {
     try {
@@ -126,7 +129,6 @@ function extractEventDetailsFromHtml(html) {
     if (name && date && venue) break;
   }
 
-  // Try __NEXT_DATA__
   if (!name || !date || !venue) {
     const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
     if (nextMatch) {
@@ -163,6 +165,9 @@ async function scrapeEvent(event) {
     const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
     const html = await fetchWithDecodo(url);
     if (!html) { console.error('  No HTML returned for', eventId); return null; }
+
+    // DEBUG: log first 3000 chars of HTML to see what Decodo returns
+    console.log('  HTML snippet:', html.slice(0, 3000));
 
     const details = extractEventDetailsFromHtml(html);
     let name = details.name || originalName;

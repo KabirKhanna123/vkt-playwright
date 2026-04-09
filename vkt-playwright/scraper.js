@@ -57,9 +57,9 @@ async function postSnapshot(payload) {
   } catch(e) { console.error('Snapshot error:', e.message); return false; }
 }
 
+// Fetch a URL through Decodo (returns HTML string)
 async function fetchWithDecodo(url) {
   try {
-    console.log('  Decodo fetching:', url);
     const response = await fetch('https://scraper-api.decodo.com/v2/scrape', {
       method: 'POST',
       headers: {
@@ -71,38 +71,67 @@ async function fetchWithDecodo(url) {
         url: url,
         proxy_pool: 'premium',
         headless: 'html',
-        wait_for_selector: 'body',
-        wait: 5000
+        wait_for_selector: 'body'
       })
     });
     if (!response.ok) {
-      const errText = await response.text();
-      console.error('  Decodo API error:', response.status, errText);
+      console.error('  Decodo API error:', response.status, await response.text());
       return null;
     }
     const data = await response.json();
-    const html = data?.results?.[0]?.content || data?.content || data?.html || null;
-    if (!html) { console.error('  Decodo empty HTML. Full response:', JSON.stringify(data).slice(0,500)); }
-    return html;
+    return data?.results?.[0]?.content || data?.content || data?.html || null;
   } catch(e) {
     console.error('  Decodo fetch error:', e.message);
     return null;
   }
 }
 
-function extractListingsAndPricesFromHtml(html) {
-  const listingMatches = [...html.matchAll(/(\d[\d,]*)\s+listings?/gi)]
-    .map(m => parseInt(m[1].replace(/,/g,''), 10))
-    .filter(v => Number.isFinite(v) && v >= 0);
-  const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
+// Fetch StubHub listings API directly through Decodo
+async function fetchListingsApi(eventId) {
+  try {
+    // StubHub internal listings API - returns JSON with all listing data
+    const apiUrl = `https://www.stubhub.com/api/search/catalog/listings/v3?eventId=${eventId}&quantity=1&pricingSummary=true&rows=250&start=0`;
+    const response = await fetch('https://scraper-api.decodo.com/v2/scrape', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': 'Basic ' + DECODO_TOKEN,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        url: apiUrl,
+        proxy_pool: 'premium',
+        headless: 'html',
+        headers: {
+          'Accept': 'application/json',
+          'Referer': `https://www.stubhub.com/event/${eventId}/`,
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
+      })
+    });
+    if (!response.ok) {
+      console.error('  Listings API Decodo error:', response.status);
+      return null;
+    }
+    const data = await response.json();
+    const content = data?.results?.[0]?.content || data?.content || null;
+    if (!content) return null;
 
-  const prices = [];
-  for (const match of html.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-    const value = parseFloat(match[1].replace(/,/g,''));
-    if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
+    // Parse the JSON response from StubHub's API
+    let parsed;
+    try { parsed = JSON.parse(content); } catch(_) {
+      // Sometimes content has HTML wrapper, try extracting JSON
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) { try { parsed = JSON.parse(jsonMatch[0]); } catch(_) {} }
+    }
+    if (!parsed) { console.error('  Could not parse listings API response'); return null; }
+
+    console.log('  Listings API keys:', Object.keys(parsed));
+    return parsed;
+  } catch(e) {
+    console.error('  Listings API error:', e.message);
+    return null;
   }
-  prices.sort((a,b)=>a-b);
-  return { totalListings, prices };
 }
 
 function extractEventDetailsFromHtml(html) {
@@ -154,7 +183,51 @@ function extractEventDetailsFromHtml(html) {
     }
   }
 
+  // Fallback: extract name from title tag
+  if (!name) {
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+    if (titleMatch) {
+      let t = titleMatch[1].replace(/\s*[-–|].*?(StubHub|Tickets).*$/i, '').trim();
+      if (t && !t.toLowerCase().includes('tickets')) name = t;
+    }
+  }
+
   return { name: name||null, date: date||null, venue: venue||null };
+}
+
+function extractPricesFromListingsApi(apiData) {
+  if (!apiData) return { totalListings: 0, prices: [] };
+
+  // Try different response shapes StubHub API might return
+  const totalListings =
+    apiData.totalListings ||
+    apiData.numFound ||
+    apiData.total ||
+    apiData.listings?.length ||
+    0;
+
+  const prices = [];
+
+  // From pricingSummary if available
+  if (apiData.pricingSummary) {
+    const ps = apiData.pricingSummary;
+    if (ps.minPrice) prices.push(safeNum(ps.minPrice));
+    if (ps.maxPrice) prices.push(safeNum(ps.maxPrice));
+    if (ps.avgPrice) prices.push(safeNum(ps.avgPrice));
+  }
+
+  // From individual listings
+  const listings = apiData.listing || apiData.listings || apiData.stubhubDocument?.listing || [];
+  for (const l of listings) {
+    const p = l.currentPrice?.amount || l.listingPrice?.amount || l.pricePerTicket || l.price;
+    if (p) {
+      const val = safeNum(p);
+      if (val > 0 && val < 25000) prices.push(val);
+    }
+  }
+
+  console.log('  API: totalListings='+totalListings+', prices found='+prices.length);
+  return { totalListings, prices };
 }
 
 async function scrapeEvent(event) {
@@ -162,23 +235,26 @@ async function scrapeEvent(event) {
   const originalName = event.name || 'Event '+eventId;
 
   try {
-    const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
-    const html = await fetchWithDecodo(url);
+    // Fetch event page for metadata
+    const pageUrl = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
+    console.log('  Fetching event page...');
+    const html = await fetchWithDecodo(pageUrl);
     if (!html) { console.error('  No HTML returned for', eventId); return null; }
-
-    // DEBUG: log first 3000 chars of HTML to see what Decodo returns
-    console.log('  HTML snippet:', html.slice(0, 3000));
 
     const details = extractEventDetailsFromHtml(html);
     let name = details.name || originalName;
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
     const venue = details.venue || event.venue || null;
     const date = details.date || event.date || null;
+    console.log('  Event:', name, '|', date, '|', venue);
 
-    const { totalListings, prices } = extractListingsAndPricesFromHtml(html);
+    // Fetch listings via StubHub's internal API
+    console.log('  Fetching listings API...');
+    const listingsData = await fetchListingsApi(eventId);
+    const { totalListings, prices } = extractPricesFromListingsApi(listingsData);
     const summary = summarizePrices(prices);
 
-    if (!summary.floor) { console.log('  No pricing for '+name); return null; }
+    if (!summary.floor) { console.log('  No pricing data for '+name); return null; }
 
     console.log('  '+name+': '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg);
 

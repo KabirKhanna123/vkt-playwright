@@ -1,19 +1,22 @@
+const { chromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { createClient } = require('@supabase/supabase-js');
+
+chromium.use(StealthPlugin());
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
 const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
-const DECODO_TOKEN = process.env.DECODO_TOKEN || 'VTAwMDAzODg2OTg6UFdfMWQxMWYxY2ZlNTZhNWY2MzQ1YWVkMjUzZGUzNjI4MjA3';
 
-const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '5000', 10);
-const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '2000', 10);
+const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '8000', 10);
+const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '3000', 10);
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
 const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
-const MIN_HTML_LENGTH = 100000;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function randomDelay(min, max) { return sleep(min + Math.random() * (max - min)); }
 function safeNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
 function normalizeDateString(value) {
@@ -63,269 +66,113 @@ async function postSnapshot(payload) {
   } catch(e) { console.error('  Snapshot error:', e.message); return false; }
 }
 
-async function fetchWithDecodo(url) {
-  try {
-    const response = await fetch('https://scraper-api.decodo.com/v2/scrape', {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Authorization': 'Basic ' + DECODO_TOKEN,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        url: url,
-        proxy_pool: 'premium',
-        headless: 'html'
-      })
-    });
-    if (!response.ok) {
-      console.error('  Decodo error:', response.status, await response.text());
-      return null;
-    }
-    const data = await response.json();
-    return data?.results?.[0]?.content || data?.content || data?.html || null;
-  } catch(e) {
-    console.error('  Decodo fetch error:', e.message);
-    return null;
-  }
-}
-
-function extractFromHtml(html) {
-  let name = null, date = null, venue = null;
-  let totalListings = 0;
-  const prices = [];
-
-  // --- JSON-LD ---
-  const jsonLdMatches = [...html.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
-  for (const match of jsonLdMatches) {
+async function dismissModals(page) {
+  for (const sel of ['button:has-text("Accept")','button:has-text("Continue")','button:has-text("Close")','button[aria-label="Close"]','[data-testid="close-button"]']) {
     try {
-      const parsed = JSON.parse(match[1]);
-      const items = Array.isArray(parsed) ? parsed : [parsed];
-      for (const item of items) {
-        if (!item || typeof item !== 'object') continue;
-        if (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent') continue;
-        if (!name && item.name && !item.name.toLowerCase().includes('tickets')) name = item.name;
-        if (!date && item.startDate) date = normalizeDateString(item.startDate);
-        if (!venue && item.location?.name) {
-          const city = item.location.address?.addressLocality || '';
-          const state = item.location.address?.addressRegion || '';
-          venue = [item.location.name, city, state].filter(Boolean).join(', ');
-        }
-        if (name && date && venue) break;
-      }
+      const el = page.locator(sel).first();
+      if (await el.isVisible({timeout:600})) { await el.click({timeout:800}); await page.waitForTimeout(400); }
     } catch(_) {}
-    if (name && date && venue) break;
   }
+}
 
-  // --- __NEXT_DATA__ ---
-  if (!name || !date || !venue) {
-    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
-    if (nextMatch) {
+async function extractPageData(page) {
+  return await page.evaluate(() => {
+    // Event metadata from JSON-LD
+    let name = null, date = null, venue = null;
+    const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+    for (const script of scripts) {
       try {
-        const parsed = JSON.parse(nextMatch[1]);
-        function walk(obj) {
-          if (!obj || typeof obj !== 'object') return;
-          if (!name && typeof obj.name === 'string' && !obj.name.toLowerCase().includes('tickets') && obj.name.length < 200) name = obj.name.trim();
-          if (!date && typeof obj.startDate === 'string') date = normalizeDateString(obj.startDate);
-          if (!date && typeof obj.date === 'string') date = normalizeDateString(obj.date);
-          if (!venue) {
-            if (typeof obj.venueName === 'string') venue = obj.venueName.trim();
-            else if (obj.venue && typeof obj.venue.name === 'string') {
-              const city = obj.venue.city?.name || obj.venue.city || '';
-              const state = obj.venue.state?.stateCode || obj.venue.state || '';
-              venue = [obj.venue.name, city, state].filter(Boolean).join(', ');
-            } else if (typeof obj.locationName === 'string') venue = obj.locationName.trim();
+        const parsed = JSON.parse(script.textContent);
+        const items = Array.isArray(parsed) ? parsed : [parsed];
+        for (const item of items) {
+          if (!item || typeof item !== 'object') continue;
+          if (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent') continue;
+          if (!name && item.name && !item.name.toLowerCase().includes('tickets')) name = item.name;
+          if (!date && item.startDate) date = item.startDate;
+          if (!venue && item.location?.name) {
+            const city = item.location.address?.addressLocality || '';
+            const state = item.location.address?.addressRegion || '';
+            venue = [item.location.name, city, state].filter(Boolean).join(', ');
           }
-          for (const k of Object.keys(obj)) { if (obj[k] && typeof obj[k] === 'object') walk(obj[k]); }
+          if (name && date && venue) break;
         }
-        walk(parsed);
       } catch(_) {}
+      if (name && date && venue) break;
     }
-  }
 
-  // --- app-context fallback ---
-  if (!date || !venue) {
-    const appCtxMatch = html.match(/<script id="app-context"[^>]*>([\s\S]*?)<\/script>/i);
-    if (appCtxMatch) {
-      try {
-        const ctx = JSON.parse(appCtxMatch[1]);
-        if (!date && ctx.eventDate) date = normalizeDateString(ctx.eventDate);
-        if (!venue && ctx.venueName) venue = ctx.venueName;
-        if (!venue && ctx.venueConfigName) venue = ctx.venueConfigName;
-      } catch(_) {}
+    // Listing count and prices from page text
+    const bodyText = document.body?.innerText || '';
+    const listingMatches = [...bodyText.matchAll(/(\d[\d,]*)\s+listings?/gi)]
+      .map(m => parseInt(m[1].replace(/,/g,''), 10))
+      .filter(v => Number.isFinite(v) && v >= 0);
+    const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
+
+    const prices = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (!node.parentElement) continue;
+      if (node.parentElement.closest('script,style,noscript,svg')) continue;
+      const style = window.getComputedStyle(node.parentElement);
+      if (style.display==='none' || style.visibility==='hidden') continue;
+      for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+        const value = parseFloat(match[1].replace(/,/g,''));
+        if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
+      }
     }
-  }
+    prices.sort((a,b)=>a-b);
 
-  // --- Raw regex fallbacks ---
-  if (!date) {
-    const m = html.match(/"startDate"\s*:\s*"([^"]+)"/);
-    if (m) date = normalizeDateString(m[1]);
-  }
-  if (!venue) {
-    const m = html.match(/"venueName"\s*:\s*"([^"]+)"/);
-    if (m) venue = m[1];
-  }
+    // Section IDs from SVG map
+    const sectionIds = [];
+    const seen = new Set();
+    document.querySelectorAll('[sprite-identifier]').forEach(el => {
+      const value = el.getAttribute('sprite-identifier');
+      if (value && /^s\d+$/i.test(value) && !seen.has(value)) {
+        seen.add(value);
+        // Try to get section name
+        const label = el.getAttribute('aria-label') || el.getAttribute('title') || null;
+        const parent = el.closest('g');
+        const textEl = parent ? parent.querySelector('text') : null;
+        const textLabel = textEl?.textContent?.trim() || null;
+        sectionIds.push({ id: value.replace(/^s/i,''), name: label || textLabel || null });
+      }
+    });
 
-  // --- Title fallback for name ---
-  if (!name) {
-    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-    if (titleMatch) {
-      let t = titleMatch[1].replace(/\s*tickets\s*[-–|].*$/i, '').replace(/\s*[-–|].*$/i, '').trim();
-      if (t && !t.toLowerCase().includes('tickets')) name = t;
-    }
-  }
-
-  // --- Listing count ---
-  const listingPatterns = [
-    /(\d[\d,]+)\s+tickets?\s+from/gi,
-    /(\d[\d,]+)\s+listings?/gi,
-    /"listingCount"\s*:\s*(\d+)/gi,
-    /"totalListings"\s*:\s*(\d+)/gi,
-    /"numFound"\s*:\s*(\d+)/gi,
-    /"ticketCount"\s*:\s*(\d+)/gi,
-  ];
-  for (const pattern of listingPatterns) {
-    const matches = [...html.matchAll(pattern)].map(m => parseInt(m[1].replace(/,/g,''), 10)).filter(v => v > 0);
-    if (matches.length) { totalListings = Math.max(...matches); break; }
-  }
-
-  // --- Prices ---
-  for (const match of html.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-    const value = parseFloat(match[1].replace(/,/g,''));
-    if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
-  }
-  for (const match of html.matchAll(/"(?:currentPrice|listingPrice|pricePerTicket|minPrice|price|amount)"\s*:\s*([\d.]+)/g)) {
-    const value = parseFloat(match[1]);
-    if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
-  }
-
-  prices.sort((a,b)=>a-b);
-  return { name, date, venue, totalListings, prices };
+    return { name, date, venue, totalListings, prices, sectionIds };
+  });
 }
 
-// Extract section IDs and names from HTML
-function extractSections(html) {
-  const sections = [];
-  const seen = new Set();
+async function scrapeUrl(page, url, waitMs = 4000) {
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await randomDelay(waitMs, waitMs + 2000);
+  await dismissModals(page);
 
-  // Method 1: sprite-identifier attributes in SVG map
-  for (const match of html.matchAll(/sprite-identifier="s(\d+)"[^>]*(?:aria-label|title)="([^"]+)"/g)) {
-    const id = match[1];
-    const label = match[2].trim();
-    if (!seen.has(id)) { seen.add(id); sections.push({ id, name: label }); }
-  }
-  for (const match of html.matchAll(/(?:aria-label|title)="([^"]+)"[^>]*sprite-identifier="s(\d+)"/g)) {
-    const id = match[2];
-    const label = match[1].trim();
-    if (!seen.has(id)) { seen.add(id); sections.push({ id, name: label }); }
+  // Check if we hit a bot challenge
+  const title = await page.title();
+  const isChallenge = title === '' || title.toLowerCase().includes('just a moment') || title.toLowerCase().includes('checking');
+  if (isChallenge) {
+    console.log('  Bot challenge detected, waiting longer...');
+    await randomDelay(5000, 8000);
   }
 
-  // Method 2: embedded JSON section data
-  const sectionJsonMatches = [...html.matchAll(/"sectionId"\s*:\s*"?(\d+)"?[^}]*"sectionName"\s*:\s*"([^"]+)"/g)];
-  for (const match of sectionJsonMatches) {
-    const id = match[1];
-    const name = match[2].trim();
-    if (!seen.has(id)) { seen.add(id); sections.push({ id, name }); }
-  }
-  // Also try reversed order
-  const sectionJsonMatches2 = [...html.matchAll(/"sectionName"\s*:\s*"([^"]+)"[^}]*"sectionId"\s*:\s*"?(\d+)"?/g)];
-  for (const match of sectionJsonMatches2) {
-    const id = match[2];
-    const name = match[1].trim();
-    if (!seen.has(id)) { seen.add(id); sections.push({ id, name }); }
-  }
-
-  // Method 3: sprite-identifier only (no name available, use ID as name)
-  if (sections.length === 0) {
-    for (const match of html.matchAll(/sprite-identifier="s(\d+)"/g)) {
-      const id = match[1];
-      if (!seen.has(id)) { seen.add(id); sections.push({ id, name: 'Section '+id }); }
-    }
-  }
-
-  console.log('  Sections found:', sections.length);
-  return sections;
+  return await extractPageData(page);
 }
 
-async function scrapeSections(eventId, eventName, eventDate, venue, eventSummary, sections, totalListings) {
-  let posted = 0;
-  for (const section of sections) {
-    try {
-      const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${section.id}&quantity=0`;
-      const html = await fetchWithDecodo(secUrl);
-      if (!html || html.length < MIN_HTML_LENGTH) {
-        await sleep(SECTION_DELAY_MS);
-        continue;
-      }
-
-      const { totalListings: secTotal, prices: secPrices } = extractFromHtml(html);
-
-      // Skip if no listings or same as event total (section filter didn't work)
-      if (!secTotal || secTotal === totalListings) {
-        await sleep(SECTION_DELAY_MS);
-        continue;
-      }
-
-      const secSummary = summarizePrices(secPrices);
-      if (!secSummary.floor) {
-        await sleep(SECTION_DELAY_MS);
-        continue;
-      }
-
-      const ok = await postSnapshot({
-        eventId,
-        eventName,
-        eventDate,
-        venue,
-        platform: 'StubHub',
-        totalListings: 0,
-        section: section.name,
-        sectionListings: secTotal,
-        sectionFloor: secSummary.floor,
-        sectionAvg: secSummary.avg,
-        sectionCeiling: secSummary.ceiling,
-        eventFloor: eventSummary.floor,
-        eventAvg: eventSummary.avg,
-        eventCeiling: eventSummary.ceiling,
-        source: 'decodo'
-      });
-
-      if (ok) {
-        posted++;
-        console.log('    Section '+section.name+': '+secTotal+' listings, floor $'+secSummary.floor);
-      }
-
-      await sleep(SECTION_DELAY_MS);
-    } catch(e) {
-      console.error('    Section '+section.name+' failed:', e.message);
-      continue;
-    }
-  }
-  console.log('  Sections posted: '+posted+'/'+sections.length);
-  return posted;
-}
-
-async function scrapeEvent(event) {
+async function scrapeEvent(page, event) {
   const eventId = event.id;
   const originalName = event.name || 'Event '+eventId;
   const isMajor = event.is_major === true;
 
   try {
     const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
-    const html = await fetchWithDecodo(url);
-    if (!html) { console.error('  No HTML for', eventId); return null; }
+    console.log('  Fetching:', url);
+    const data = await scrapeUrl(page, url);
 
-    if (html.length < MIN_HTML_LENGTH) {
-      console.log('  Skipping '+eventId+' — HTML too small ('+html.length+'), likely bot challenge');
-      return null;
-    }
-
-    const { name: parsedName, date: parsedDate, venue: parsedVenue, totalListings, prices } = extractFromHtml(html);
-
-    let name = parsedName || originalName;
+    let name = data.name || originalName;
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
-    const venue = parsedVenue || event.venue || null;
-    const date = parsedDate || event.date || null;
+    const venue = data.venue || event.venue || null;
+    const date = normalizeDateString(data.date) || event.date || null;
+    const { totalListings, prices } = data;
 
     const summary = summarizePrices(prices);
     if (!summary.floor) { console.log('  No pricing for '+name); return null; }
@@ -337,7 +184,7 @@ async function scrapeEvent(event) {
       eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
       totalListings, section:null, sectionListings:0,
       eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
-      source:'decodo'
+      source:'playwright'
     });
 
     const updates = {};
@@ -347,14 +194,42 @@ async function scrapeEvent(event) {
     if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id',eventId);
 
     // Section scraping for major events
-    if (isMajor) {
-      console.log('  Extracting sections...');
-      const sections = extractSections(html);
-      if (sections.length > 0) {
-        await scrapeSections(eventId, name, date, venue, summary, sections, totalListings);
-      } else {
-        console.log('  No sections found in HTML for major event — may need map interaction');
+    if (isMajor && data.sectionIds.length > 0) {
+      console.log('  Scraping '+data.sectionIds.length+' sections...');
+      let postedSections = 0;
+
+      for (const section of data.sectionIds) {
+        try {
+          const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${section.id}&quantity=0`;
+          const secData = await scrapeUrl(page, secUrl, SECTION_DELAY_MS);
+
+          const secTotal = secData.totalListings;
+          if (!secTotal || secTotal === totalListings) continue;
+
+          const secSummary = summarizePrices(secData.prices);
+          if (!secSummary.floor) continue;
+
+          const sectionName = section.name || 'Section '+section.id;
+
+          const ok = await postSnapshot({
+            eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
+            totalListings:0, section:sectionName, sectionListings:secTotal,
+            sectionFloor:secSummary.floor, sectionAvg:secSummary.avg, sectionCeiling:secSummary.ceiling,
+            eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
+            source:'playwright'
+          });
+
+          if (ok) {
+            postedSections++;
+            console.log('    '+sectionName+': '+secTotal+' listings, floor $'+secSummary.floor);
+          }
+
+          await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 1500);
+        } catch(e) { console.error('    Section '+section.id+' failed:', e.message); continue; }
       }
+      console.log('  Sections: '+postedSections+'/'+data.sectionIds.length+' posted');
+    } else if (isMajor) {
+      console.log('  No section IDs found in page');
     }
 
     return { ok:true };
@@ -366,8 +241,52 @@ async function main() {
   console.log('VKT Playwright scraper starting...');
 
   const manualId = process.argv[2];
-  let events = manualId ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:true }] : await getEvents();
+  let events = manualId
+    ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:true }]
+    : await getEvents();
   console.log('Events to process: '+events.length);
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--disable-gpu',
+      '--window-size=1280,900'
+    ]
+  });
+
+  const context = await browser.newContext({
+    viewport: { width:1280, height:900 },
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+    }
+  });
+
+  // Stealth patches
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+    window.chrome = { runtime: {} };
+  });
+
+  const page = await context.newPage();
+
+  // Warm up with a google visit first to look more human
+  try {
+    await page.goto('https://www.google.com', { waitUntil:'domcontentloaded', timeout:10000 });
+    await randomDelay(1500, 3000);
+  } catch(_) {}
 
   let scraped=0, skipped=0, failed=0;
 
@@ -377,11 +296,12 @@ async function main() {
       if (recent) { console.log('Skipping '+event.name+' (recent)'); skipped++; continue; }
     }
     console.log('\nScraping: '+event.name+' ('+event.id+')');
-    const result = await scrapeEvent(event);
+    const result = await scrapeEvent(page, event);
     if (result) scraped++; else failed++;
-    await sleep(SCRAPE_DELAY_MS);
+    await randomDelay(SCRAPE_DELAY_MS, SCRAPE_DELAY_MS + 3000);
   }
 
+  await browser.close();
   console.log('\nDone — scraped:'+scraped+' skipped:'+skipped+' failed:'+failed);
 }
 

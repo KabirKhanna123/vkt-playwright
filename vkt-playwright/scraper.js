@@ -22,7 +22,7 @@ async function dismissModals(page) {
 }
 
 async function main() {
-  console.log('VKT debug: intercept API responses');
+  console.log('VKT debug: click map and capture navigation');
 
   const eventId = process.argv[2] || '160425611';
 
@@ -46,26 +46,11 @@ async function main() {
     window.chrome = { runtime: {} };
   });
 
-  const interestingResponses = [];
-
-  context.on('response', async response => {
-    const url = response.url();
-    const status = response.status();
-    if (status !== 200) return;
-    if (url.includes('.js') || url.includes('.css') || url.includes('.png') || url.includes('.pbf') || url.includes('.woff')) return;
-
-    try {
-      const text = await response.text();
-      if (text.length < 50 || text.length > 300000) return;
-      if (!text.startsWith('{') && !text.startsWith('[')) return;
-      if (text.includes('section') || text.includes('listing')) {
-        interestingResponses.push({
-          url: url.slice(0, 200),
-          size: text.length,
-          sample: text.slice(0, 400)
-        });
-      }
-    } catch(_) {}
+  // Track all navigation/request URLs
+  const capturedUrls = [];
+  context.on('request', req => {
+    const u = req.url();
+    if (u.includes(eventId) && u.includes('section')) capturedUrls.push(u);
   });
 
   const page = await context.newPage();
@@ -75,18 +60,59 @@ async function main() {
   const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
   console.log('Loading:', url);
   await page.goto(url, { waitUntil:'domcontentloaded', timeout:30000 });
-
-  // Wait for JS to fire API calls
-  console.log('Waiting for API calls...');
-  await sleep(10000);
+  await randomDelay(6000, 8000);
   await dismissModals(page);
 
-  console.log('\n--- Intercepted JSON API responses ('+interestingResponses.length+') ---');
-  interestingResponses.forEach((r, i) => {
-    console.log('\n['+i+'] '+r.url);
-    console.log('Size: '+r.size);
-    console.log('Sample: '+r.sample);
+  // Get all sprite elements with their bounding boxes
+  const spriteInfo = await page.evaluate(() => {
+    const els = Array.from(document.querySelectorAll('[sprite-identifier]'));
+    return els.slice(0, 10).map(el => {
+      const rect = el.getBoundingClientRect();
+      return {
+        id: el.getAttribute('sprite-identifier'),
+        x: rect.x + rect.width/2,
+        y: rect.y + rect.height/2,
+        visible: rect.width > 0 && rect.height > 0
+      };
+    });
   });
+
+  console.log('Sprite elements:', JSON.stringify(spriteInfo.slice(0, 5)));
+
+  // Click each visible sprite using mouse coordinates and capture URL changes
+  const sectionMap = [];
+  for (const sprite of spriteInfo.filter(s => s.visible && s.x > 0 && s.y > 0).slice(0, 5)) {
+    try {
+      console.log('\nClicking sprite:', sprite.id, 'at', sprite.x, sprite.y);
+      await page.mouse.click(sprite.x, sprite.y);
+      await sleep(2000);
+
+      const currentUrl = page.url();
+      console.log('URL after click:', currentUrl);
+
+      // Extract sections param from URL
+      const sectionsParam = new URL(currentUrl).searchParams.get('sections');
+      if (sectionsParam) {
+        sectionMap.push({ spriteId: sprite.id, sectionsParam });
+        console.log('  sections param:', sectionsParam);
+      }
+
+      // Also check innerText for section name
+      const secText = await page.evaluate(() => {
+        const bodyText = document.body?.innerText || '';
+        const match = bodyText.match(/Section\s+(\d+)/i);
+        return match ? match[0] : null;
+      });
+      if (secText) console.log('  section text on page:', secText);
+
+    } catch(e) { console.log('Click failed:', e.message); }
+  }
+
+  console.log('\n--- Section ID map ---');
+  sectionMap.forEach(m => console.log(m.spriteId, '->', m.sectionsParam));
+
+  console.log('\n--- Captured section URLs ---');
+  capturedUrls.forEach(u => console.log(u.slice(0, 200)));
 
   await browser.close();
 }

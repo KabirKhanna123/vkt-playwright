@@ -1,7 +1,6 @@
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { createClient } = require('@supabase/supabase-js');
-const fetch = require('node-fetch');
 
 chromium.use(StealthPlugin());
 

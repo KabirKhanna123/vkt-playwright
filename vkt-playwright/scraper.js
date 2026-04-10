@@ -15,9 +15,8 @@ const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
-// IMPORTANT: adjust this to StubHub's real ticket row selector
-// e.g. '[data-testid="ticket-row"]' or '.TicketRow'
-const TICKET_ROW_SELECTOR = process.env.TICKET_ROW_SELECTOR || '[data-testid="ticket-row"]';
+// Ticket row selector for StubHub (from your HTML snippet)
+const TICKET_ROW_SELECTOR = 'div[data-listing-id]';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 

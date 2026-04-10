@@ -10,6 +10,43 @@ const SKIP = [
   'gift-card', 'voucher', 'package-deal'
 ];
 
+// Major league team keywords — events matching these get is_major = true
+const MAJOR_KEYWORDS = [
+  // NFL
+  'patriots', 'cowboys', 'chiefs', 'packers', '49ers', 'eagles', 'giants',
+  'ravens', 'steelers', 'broncos', 'bears', 'lions', 'falcons', 'saints',
+  'buccaneers', 'panthers', 'cardinals', 'seahawks', 'rams', 'chargers',
+  'raiders', 'dolphins', 'bills', 'jets', 'browns', 'bengals', 'colts',
+  'titans', 'jaguars', 'texans', 'vikings', 'commanders', 'redskins',
+  // MLB
+  'yankees', 'dodgers', 'red-sox', 'cubs', 'mets', 'astros', 'braves',
+  'phillies', 'giants', 'cardinals', 'brewers', 'padres', 'athletics',
+  'rangers', 'mariners', 'angels', 'tigers', 'twins', 'white-sox',
+  'guardians', 'royals', 'pirates', 'reds', 'rockies', 'diamondbacks',
+  'orioles', 'blue-jays', 'rays', 'nationals', 'marlins',
+  // NBA
+  'lakers', 'celtics', 'warriors', 'knicks', 'bulls', 'heat', 'nets',
+  '76ers', 'bucks', 'nuggets', 'suns', 'mavericks', 'clippers', 'raptors',
+  'spurs', 'thunder', 'jazz', 'blazers', 'rockets', 'pelicans', 'grizzlies',
+  'hawks', 'hornets', 'pacers', 'pistons', 'wizards', 'magic', 'cavaliers',
+  'timberwolves', 'kings',
+  // NHL
+  'bruins', 'rangers', 'maple-leafs', 'blackhawks', 'penguins', 'capitals',
+  'lightning', 'avalanche', 'golden-knights', 'oilers', 'flames', 'canucks',
+  'canadiens', 'senators', 'sabres', 'red-wings', 'blues', 'predators',
+  'coyotes', 'sharks', 'ducks', 'kings', 'stars', 'wild', 'jets',
+  'hurricanes', 'panthers', 'blue-jackets', 'devils', 'islanders',
+  // High-demand concerts / events
+  'taylor-swift', 'beyonce', 'drake', 'bad-bunny', 'kendrick-lamar',
+  'superbowl', 'super-bowl', 'world-series', 'nba-finals', 'stanley-cup',
+  'coachella', 'lollapalooza'
+];
+
+function isMajorEvent(url, name) {
+  const check = (url + ' ' + (name || '')).toLowerCase();
+  return MAJOR_KEYWORDS.some(k => check.includes(k));
+}
+
 function extractEventId(url) {
   const m = url.match(/\/event\/(\d{5,})/);
   return m ? m[1] : null;
@@ -23,22 +60,19 @@ function isEventUrl(url) {
 }
 
 function nameFromUrl(url) {
-  // Extract clean name from URL slug
-  // e.g. /new-york-yankees-bronx-tickets-4-13-2026/event/159257396/
   const parts = url.split('/').filter(Boolean);
   const slug = parts.find(function(p) {
     return p.includes('-tickets') || (p.length > 10 && p.includes('-'));
   }) || '';
   return slug
-    .replace(/-\d{1,2}-\d{4}.*$/, '')     // remove date suffix
-    .replace(/-tickets.*$/, '')             // remove -tickets suffix
+    .replace(/-\d{1,2}-\d{4}.*$/, '')
+    .replace(/-tickets.*$/, '')
     .replace(/-/g, ' ')
     .replace(/\b\w/g, function(c) { return c.toUpperCase(); })
     .trim() || 'StubHub Event';
 }
 
 function dateFromUrl(url) {
-  // Try to extract date from URL e.g. -4-13-2026- or -april-13-2026-
   const m = url.match(/-(\d{1,2})-(\d{1,2})-(\d{4})/);
   if (m) {
     const month = m[1].padStart(2, '0');
@@ -73,7 +107,6 @@ function extractUrls(xml) {
 async function main() {
   console.log('Sitemap seeder starting — pulling ALL major events...');
 
-  // StubHub paginates sitemaps — try pages 0-19 to get maximum coverage
   const sitemaps = [];
   for (let i = 0; i <= 19; i++) {
     sitemaps.push('https://www.stubhub.com/new-sitemap/us/US-en-grouping-' + i + '.xml');
@@ -99,11 +132,9 @@ async function main() {
 
   console.log('Total URLs found: ' + allUrls.length);
 
-  // Filter to event URLs only
   const eventUrls = allUrls.filter(isEventUrl);
   console.log('Event URLs after filter: ' + eventUrls.length);
 
-  // Dedupe by event ID
   const seen = {};
   const unique = [];
   for (const url of eventUrls) {
@@ -125,29 +156,33 @@ async function main() {
   }
   console.log('Already in DB: ' + existingIds.size);
 
-  // Seed new events
   const toSeed = unique.filter(function(e) { return !existingIds.has(e.id); });
   console.log('To seed: ' + toSeed.length);
 
   let seeded = 0;
+  let majorCount = 0;
   const insertBatch = [];
 
   for (const ev of toSeed) {
+    const name = nameFromUrl(ev.url);
+    const is_major = isMajorEvent(ev.url, name);
+    if (is_major) majorCount++;
+
     insertBatch.push({
       id: ev.id,
-      name: nameFromUrl(ev.url),
+      name: name,
       date: dateFromUrl(ev.url),
       venue: null,
       platform: 'StubHub',
+      is_major: is_major,
       updated_at: new Date().toISOString()
     });
 
-    // Insert in batches of 100
     if (insertBatch.length >= 100) {
       const { error } = await supabase.from('events').upsert(insertBatch, { onConflict: 'id' });
       if (!error) {
         seeded += insertBatch.length;
-        console.log('Seeded batch of ' + insertBatch.length + ' (total: ' + seeded + ')');
+        console.log('Seeded batch of ' + insertBatch.length + ' (total: ' + seeded + ', major so far: ' + majorCount + ')');
       } else {
         console.log('Batch error: ' + error.message);
       }
@@ -155,7 +190,6 @@ async function main() {
     }
   }
 
-  // Insert remaining
   if (insertBatch.length > 0) {
     const { error } = await supabase.from('events').upsert(insertBatch, { onConflict: 'id' });
     if (!error) {
@@ -164,7 +198,26 @@ async function main() {
     }
   }
 
-  console.log('Done: ' + seeded + ' new events seeded');
+  console.log('Done: ' + seeded + ' new events seeded, ' + majorCount + ' marked as major');
+
+  // Also backfill is_major on existing events that match keywords
+  console.log('Backfilling is_major on existing events...');
+  const { data: existing } = await supabase
+    .from('events')
+    .select('id,name')
+    .is('is_major', null)
+    .limit(5000);
+
+  if (existing && existing.length > 0) {
+    const toUpdate = existing.filter(e => isMajorEvent('', e.name)).map(e => e.id);
+    console.log('Existing events to mark as major: ' + toUpdate.length);
+    for (let i = 0; i < toUpdate.length; i += 100) {
+      const batch = toUpdate.slice(i, i + 100);
+      await supabase.from('events').update({ is_major: true }).in('id', batch);
+    }
+    console.log('Backfill done');
+  }
+
   process.exit(0);
 }
 

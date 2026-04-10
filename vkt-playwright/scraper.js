@@ -46,23 +46,19 @@ function summarizePrices(prices) {
   };
 }
 
-// Build StubHub SEO URL slug from event name, venue, date
-// e.g. "new-england-patriots-foxborough-tickets-3-3-2027/event/160425611"
+// Build SEO URL from event data as fallback
 function buildStubHubUrl(event, suffix='?quantity=0') {
   const eventId = event.id;
 
-  // Try to build slug from name + venue + date
   if (event.name && event.date) {
     try {
-      // Extract home team (after "at") or just use full name
       const nameSlug = event.name
         .toLowerCase()
-        .replace(/\s+at\s+/i, ' ')     // "X at Y" -> "X Y"
-        .replace(/[^a-z0-9\s]/g, '')   // remove special chars
+        .replace(/\s+at\s+/i, ' ')
+        .replace(/[^a-z0-9\s]/g, '')
         .trim()
-        .replace(/\s+/g, '-');         // spaces to dashes
+        .replace(/\s+/g, '-');
 
-      // Extract city from venue
       let citySlug = '';
       if (event.venue) {
         const venueParts = event.venue.split(',');
@@ -71,7 +67,6 @@ function buildStubHubUrl(event, suffix='?quantity=0') {
         }
       }
 
-      // Build date slug M-D-YYYY
       const d = new Date(event.date + 'T12:00:00');
       const dateSlug = `${d.getMonth()+1}-${d.getDate()}-${d.getFullYear()}`;
 
@@ -83,15 +78,32 @@ function buildStubHubUrl(event, suffix='?quantity=0') {
     } catch(_) {}
   }
 
-  // Fallback to short URL
-  return `https://www.stubhub.com/event/${eventId}/${suffix}`;
+  return `https://www.stubhub.com/event/${eventId}/?${suffix.replace(/^\?/,'')}`;
+}
+
+// Get the best URL to use for an event
+function getEventUrl(event, suffix='?quantity=0') {
+  // Use stored stubhub_url if available — most reliable
+  if (event.stubhub_url) {
+    const base = event.stubhub_url.split('?')[0].replace(/\/$/, '');
+    return base + '/' + suffix.replace(/^\?/, '?');
+  }
+  // Fall back to building from name/venue/date
+  return buildStubHubUrl(event, suffix);
 }
 
 async function getEvents() {
   const { data, error } = await supabase
     .from('events')
-    .select('id,name,date,venue,platform,is_major')
+    .select('id,name,date,venue,platform,is_major,stubhub_url')
     .not('id', 'like', 'tm_%')
+    .not('name', 'ilike', '%football 2026 event%')
+    .not('name', 'ilike', '%basketball 2026 event%')
+    .not('name', 'ilike', '%baseball 2026 event%')
+    .not('name', 'ilike', '%hockey 2026 event%')
+    .not('name', 'ilike', '%soccer 2026 event%')
+    .not('name', 'ilike', '% tickets')
+    .not('name', 'ilike', '%2026 event')
     .order('date', { ascending: true })
     .limit(EVENT_LIMIT);
   if (error) { console.error('Failed to fetch events:', error.message); return []; }
@@ -146,6 +158,21 @@ async function fetchWithWebUnlocker(targetUrl) {
 
   console.log('  Raw HTML length:', text.length);
   return text;
+}
+
+// Extract the actual canonical URL from the HTML (StubHub includes it in og:url or canonical)
+function extractCanonicalUrl(html, eventId) {
+  // Try og:url first
+  const ogMatch = html.match(/<meta[^>]+property="og:url"[^>]+content="([^"]+)"/i)
+    || html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:url"/i);
+  if (ogMatch && ogMatch[1].includes(eventId)) return ogMatch[1].split('?')[0];
+
+  // Try canonical link
+  const canonMatch = html.match(/<link[^>]+rel="canonical"[^>]+href="([^"]+)"/i)
+    || html.match(/<link[^>]+href="([^"]+)"[^>]+rel="canonical"/i);
+  if (canonMatch && canonMatch[1].includes(eventId)) return canonMatch[1].split('?')[0];
+
+  return null;
 }
 
 function isCorrectEventPage(html, eventId) {
@@ -279,22 +306,29 @@ async function scrapeEvent(page, event) {
   const isMajor = event.is_major === true;
 
   try {
-    // Build full SEO URL to avoid redirect to team page
-    const url = buildStubHubUrl(event);
-    console.log('  URL:', url);
-    let html = await fetchWithWebUnlocker(url);
+    // Use stored URL if available, otherwise build/guess
+    const primaryUrl = getEventUrl(event);
+    console.log('  URL:', primaryUrl);
+    let html = await fetchWithWebUnlocker(primaryUrl);
+    let usedUrl = primaryUrl;
 
-    // Fallback to short URL if SEO URL fails
+    // If wrong page, try short URL as fallback
     if (!isCorrectEventPage(html, eventId)) {
       const shortUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
-      console.log('  SEO URL failed, trying short URL...');
-      html = await fetchWithWebUnlocker(shortUrl);
+      if (shortUrl !== primaryUrl) {
+        console.log('  Primary URL failed, trying short URL...');
+        html = await fetchWithWebUnlocker(shortUrl);
+        usedUrl = shortUrl;
+      }
     }
 
     if (!isCorrectEventPage(html, eventId)) {
       console.log('  Could not get correct page for '+eventId+', skipping');
       return null;
     }
+
+    // Extract canonical URL from HTML and save it for future use
+    const canonicalUrl = extractCanonicalUrl(html, eventId);
 
     await page.setContent(html, { waitUntil:'domcontentloaded' });
     await dismissModals(page);
@@ -319,19 +353,31 @@ async function scrapeEvent(page, event) {
       source:'brightdata'
     });
 
+    // Save all improvements back to events table
     const updates = {};
     if (name !== originalName) updates.name = name;
     if (venue && venue !== event.venue) updates.venue = venue;
     if (date && date !== event.date) updates.date = date;
+    // Save canonical URL so future scrapes use it directly
+    if (canonicalUrl && canonicalUrl !== event.stubhub_url) {
+      updates.stubhub_url = canonicalUrl;
+      console.log('  Saved canonical URL:', canonicalUrl);
+    }
     if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id', eventId);
 
+    // Section scraping for major events
     if (isMajor && sectionNumbers.length > 0) {
       console.log('  Scraping '+sectionNumbers.length+' sections...');
       let postedSections = 0;
 
       for (const secNum of sectionNumbers) {
         try {
-          const secUrl = buildStubHubUrl(event, `?sections=${secNum}&quantity=0`);
+          // Use canonical URL base for section URLs if available
+          const baseUrl = canonicalUrl || (event.stubhub_url ? event.stubhub_url.split('?')[0].replace(/\/$/, '') : null);
+          const secUrl = baseUrl
+            ? `${baseUrl}/?sections=${secNum}&quantity=0`
+            : `https://www.stubhub.com/event/${eventId}/?sections=${secNum}&quantity=0`;
+
           const secHtml = await fetchWithWebUnlocker(secUrl);
           if (!secHtml || secHtml.length < 5000) { console.log('    Section '+secNum+': no HTML'); continue; }
 
@@ -370,7 +416,7 @@ async function main() {
 
   const manualId = process.argv[2];
   let events = manualId
-    ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:true }]
+    ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:true, stubhub_url:null }]
     : await getEvents();
   console.log('Events to process: '+events.length);
 

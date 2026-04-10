@@ -11,11 +11,9 @@ const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
 const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '8000', 10);
 const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '4000', 10);
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
+const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
-
-// Ticket row selector for StubHub (from your HTML snippet)
-const TICKET_ROW_SELECTOR = 'div[role="button"][data-index][data-listing-id]';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -36,10 +34,7 @@ function normalizeDateString(value) {
 }
 
 function summarizePrices(prices) {
-  const valid = (prices||[])
-    .map(safeNum)
-    .filter(v => v >= MIN_PRICE && v <= MAX_PRICE)
-    .sort((a,b) => a-b);
+  const valid = (prices||[]).map(safeNum).filter(v => v >= MIN_PRICE && v <= MAX_PRICE).sort((a,b) => a-b);
   if (!valid.length) return { floor:null, avg:null, ceiling:null };
   return {
     floor: Math.round(valid[0]),
@@ -48,83 +43,60 @@ function summarizePrices(prices) {
   };
 }
 
-// Only fetch event 160425611
 async function getEvents() {
-  console.log('[getEvents] Fetching event 160425611 from Supabase...');
   const { data, error } = await supabase
     .from('events')
     .select('id,name,date,venue,platform,is_major')
-    .eq('id', '160425611')
-    .limit(1);
-
-  if (error) {
-    console.error('[getEvents] Failed to fetch events:', error.message);
-    return [];
-  }
-  console.log('[getEvents] Result:', data);
+    .not('id','like','tm_%')
+    .order('date', { ascending: true })
+    .limit(EVENT_LIMIT);
+  if (error) { console.error('Failed to fetch events:', error.message); return []; }
   return data || [];
 }
 
-// FORCED: always return false so we never skip for "recently scraped"
 async function scrapedRecently(eventId, hours=RECENT_HOURS) {
-  console.log(`[scrapedRecently] Forcing scrape for event ${eventId} (ignoring last ${hours}h)`);
-  return false;
+  const since = new Date(Date.now() - hours*3600000).toISOString();
+  const { data } = await supabase.from('volume_snapshots').select('id').eq('event_id',eventId).is('section',null).gte('scraped_at',since).limit(1);
+  return !!(data && data.length > 0);
 }
 
 async function postSnapshot(payload) {
   try {
-    console.log('[postSnapshot] Sending payload:', JSON.stringify(payload, null, 2));
-
-    const r = await fetch(VKT_API + '/api/snapshot', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(payload)
-    });
-
-    const text = await r.text();
-    if (!r.ok) {
-      console.error('[postSnapshot] Snapshot failed:', r.status, text);
-      return false;
-    }
-
-    console.log('[postSnapshot] Snapshot success. Status:', r.status, 'Response:', text);
+    const r = await fetch(VKT_API+'/api/snapshot', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    if (!r.ok) { console.error('  Snapshot failed:', r.status, await r.text()); return false; }
     return true;
-  } catch(e) {
-    console.error('[postSnapshot] Snapshot error:', e.message);
-    return false;
-  }
+  } catch(e) { console.error('  Snapshot error:', e.message); return false; }
 }
 
 async function dismissModals(page) {
-  for (const sel of [
-    'button:has-text("Accept")',
-    'button:has-text("Continue")',
-    'button:has-text("Close")',
-    'button[aria-label="Close"]',
-    '[data-testid="close-button"]'
-  ]) {
+  for (const sel of ['button:has-text("Accept")','button:has-text("Continue")','button:has-text("Close")','button[aria-label="Close"]','[data-testid="close-button"]']) {
     try {
       const el = page.locator(sel).first();
-      if (await el.isVisible({timeout:600})) {
-        console.log(`[dismissModals] Clicking modal button: ${sel}`);
-        await el.click({timeout:800});
-        await page.waitForTimeout(400);
-      }
+      if (await el.isVisible({timeout:600})) { await el.click({timeout:800}); await page.waitForTimeout(400); }
     } catch(_) {}
   }
 }
 
+// Check if we landed on the right event page (not a redirect to team/generic page)
+async function isEventPage(page, eventId) {
+  const url = page.url();
+  const title = await page.title();
+  // Must contain the event ID in the URL
+  if (!url.includes(eventId)) return false;
+  // Must NOT be a generic schedule/tickets page
+  if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(title)) return false;
+  return true;
+}
+
 async function navigateTo(page, url, waitMs=4000) {
-  console.log('[navigateTo] Navigating to:', url);
   await page.goto(url, { waitUntil:'domcontentloaded', timeout:45000 });
   await randomDelay(waitMs, waitMs + 2000);
   await dismissModals(page);
 
   const title = (await page.title()) || '';
   const lower = title.toLowerCase();
-  console.log('[navigateTo] Page title:', title);
   if (!title || lower.includes('just a moment') || lower.includes('access denied')) {
-    console.warn('[navigateTo] Challenge page detected, retrying...');
+    console.log('  Challenge page, retrying...');
     await randomDelay(5000, 8000);
     await page.reload({ waitUntil:'domcontentloaded', timeout:45000 });
     await randomDelay(waitMs, waitMs + 2000);
@@ -132,25 +104,10 @@ async function navigateTo(page, url, waitMs=4000) {
   }
 }
 
-// Debug helper: dump first part of HTML Playwright sees
-async function debugDumpHTML(page, label) {
-  try {
-    const html = await page.content();
-    console.log(`\n[debugDumpHTML] ===== ${label} =====`);
-    console.log(html.slice(0, 5000)); // first 5k chars
-    console.log('[debugDumpHTML] ===== END =====\n');
-  } catch (e) {
-    console.error('[debugDumpHTML] Error:', e.message);
-  }
-}
-
-// EVENT-LEVEL extraction
 async function extractPageData(page) {
-  console.log('[extractPageData] Extracting event-level data...');
-  return await page.evaluate(({minPrice, maxPrice, ticketRowSelector}) => {
+  return await page.evaluate(({minPrice, maxPrice}) => {
     let name = null, date = null, venue = null;
 
-    // JSON-LD metadata
     const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
     for (const script of scripts) {
       try {
@@ -172,34 +129,33 @@ async function extractPageData(page) {
       if (name && date && venue) break;
     }
 
-    // Count ticket rows for total listings
-    let totalListings = 0;
-    try {
-      if (ticketRowSelector) {
-        totalListings = document.querySelectorAll(ticketRowSelector).length;
-      }
-    } catch(_) {}
-
-    // Prices from ticket rows only
-    const prices = [];
-    try {
-      const rows = ticketRowSelector
-        ? Array.from(document.querySelectorAll(ticketRowSelector))
-        : [];
-      for (const row of rows) {
-        const text = row.innerText || '';
-        if (!text.includes('$')) continue;
-        for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-          const value = parseFloat(match[1].replace(/,/g,''));
-          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) {
-            prices.push(value);
-          }
-        }
-      }
-    } catch(_) {}
-
-    // Section numbers from text (heuristic)
     const bodyText = document.body?.innerText || '';
+
+    // Listing count
+    const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
+      .map(m => parseInt(m[1].replace(/,/g,''), 10))
+      .filter(v => Number.isFinite(v) && v > 0);
+    const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
+
+    // Prices
+    const prices = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      try {
+        if (!node.parentElement) continue;
+        if (node.parentElement.closest('script,style,noscript,svg')) continue;
+        const style = window.getComputedStyle(node.parentElement);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+          const value = parseFloat(match[1].replace(/,/g,''));
+          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
+        }
+      } catch(_) { continue; }
+    }
+    prices.sort((a,b) => a-b);
+
+    // Section numbers from map labels
     const sectionNumbers = new Set();
     const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
     for (const line of lines) {
@@ -210,33 +166,43 @@ async function extractPageData(page) {
     }
 
     return { name, date, venue, totalListings, prices, sectionNumbers: Array.from(sectionNumbers) };
-  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE, ticketRowSelector: TICKET_ROW_SELECTOR});
+  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
 }
 
-// SECTION-LEVEL extraction (URL already filtered by ?sections=XXX)
 async function extractSectionPrices(page) {
-  console.log('[extractSectionPrices] Extracting section-level data...');
-  return await page.evaluate(({minPrice, maxPrice, ticketRowSelector}) => {
+  return await page.evaluate(({minPrice, maxPrice}) => {
     try {
-      if (!document || !document.body) {
-        return { totalListings:0, prices:[], error:'no-body' };
+      if (!document || !document.body) return { totalListings:0, prices:[], error:'no-body' };
+
+      const bodyText = document.body.innerText || '';
+
+      // Section-specific count from "Section 120 | 3 listings" header
+      const secHeaderMatch = bodyText.match(/Section\s+[\w\d]+\s*[|]\s*(\d[\d,]*)\s+listings?/i);
+      let totalListings = secHeaderMatch ? parseInt(secHeaderMatch[1].replace(/,/g,''), 10) : 0;
+
+      // Fallback: smallest "N listings" number (avoids picking up global count)
+      if (!totalListings) {
+        const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
+          .map(m => parseInt(m[1].replace(/,/g,''), 10))
+          .filter(v => Number.isFinite(v) && v > 0 && v < 500);
+        totalListings = listingMatches.length ? Math.min(...listingMatches) : 0;
       }
 
-      const rows = ticketRowSelector
-        ? Array.from(document.querySelectorAll(ticketRowSelector))
-        : [];
-      const totalListings = rows.length;
-
       const prices = [];
-      for (const row of rows) {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
         try {
-          const text = row.innerText || '';
+          if (!node.parentElement) continue;
+          if (node.parentElement.closest('script,style,noscript,svg')) continue;
+          let style;
+          try { style = window.getComputedStyle(node.parentElement); } catch { continue; }
+          if (!style || style.display === 'none' || style.visibility === 'hidden') continue;
+          const text = node.textContent || '';
           if (!text.includes('$')) continue;
           for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
             const value = parseFloat(match[1].replace(/,/g,''));
-            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) {
-              prices.push(value);
-            }
+            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
           }
         } catch { continue; }
       }
@@ -246,7 +212,7 @@ async function extractSectionPrices(page) {
     } catch(e) {
       return { totalListings:0, prices:[], error: e?.message || 'unknown' };
     }
-  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE, ticketRowSelector: TICKET_ROW_SELECTOR});
+  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
 }
 
 async function scrapeEvent(page, event) {
@@ -254,38 +220,17 @@ async function scrapeEvent(page, event) {
   const originalName = event.name || 'Event '+eventId;
   const isMajor = event.is_major === true;
 
-  console.log(`[scrapeEvent] Starting event ${eventId} (is_major=${isMajor})`);
-
   try {
-    const url = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
-    await navigateTo(page, url, SCRAPE_DELAY_MS);
+    const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
+    await navigateTo(page, url);
 
-    // Debug: see what HTML we have right after navigation
-    await debugDumpHTML(page, `After navigateTo for event ${eventId}`);
-
-    // 1) Wait for a generic ticket list container
-    console.log('[scrapeEvent] Waiting for ticket list container (div[role="button"][data-index])...');
-    await page.waitForSelector('div[role="button"][data-index]', { timeout: 20000 }).catch(() => {
-      console.warn('[scrapeEvent] Ticket list container not found within timeout');
-    });
-
-    // 2) Then wait/poll specifically for ticket rows
-    console.log('[scrapeEvent] Waiting for ticket rows selector:', TICKET_ROW_SELECTOR);
-    const rowFound = await page.waitForFunction(
-      (sel) => !!document.querySelector(sel),
-      TICKET_ROW_SELECTOR,
-      { timeout: 25000 }
-    ).then(() => true).catch(() => false);
-
-    if (!rowFound) {
-      console.warn('[scrapeEvent] Ticket row selector not found within extended timeout');
-      await debugDumpHTML(page, `No rows found for event ${eventId}`);
-    } else {
-      console.log('[scrapeEvent] Ticket rows detected.');
+    // Detect redirect to wrong page
+    if (!await isEventPage(page, eventId)) {
+      console.log('  Redirected to wrong page, skipping '+eventId);
+      return null;
     }
 
     const data = await extractPageData(page);
-    console.log('[scrapeEvent] Raw extractPageData result:', JSON.stringify(data, null, 2));
 
     let name = data.name || originalName;
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
@@ -294,154 +239,145 @@ async function scrapeEvent(page, event) {
     const { totalListings, prices, sectionNumbers } = data;
 
     const summary = summarizePrices(prices);
-    if (!summary.floor) {
-      console.log('[scrapeEvent] No valid pricing found for', name);
-      return;
-    }
+    if (!summary.floor) { console.log('  No pricing for '+name); return null; }
 
-    console.log(`  ${name} | ${date} | ${venue}`);
-    console.log(`  ${totalListings} listings, floor $${summary.floor}, atp $${summary.avg}${isMajor ? ' [MAJOR]' : ''}`);
+    console.log('  '+name+' | '+date+' | '+venue);
+    console.log('  '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg+(isMajor?' [MAJOR]':''));
 
-    // Event-level snapshot
     await postSnapshot({
-      eventId,
-      eventName: name,
-      eventDate: date,
-      venue,
-      platform: 'StubHub',
-      totalListings,
-      section: null,
-      sectionListings: 0,
-      eventFloor: summary.floor,
-      eventAvg: summary.avg,
-      eventCeiling: summary.ceiling,
-      source: 'playwright'
+      eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
+      totalListings, section:null, sectionListings:0,
+      eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
+      source:'playwright'
     });
 
-    // Update events table if metadata improved
     const updates = {};
     if (name !== originalName) updates.name = name;
     if (venue && venue !== event.venue) updates.venue = venue;
     if (date && date !== event.date) updates.date = date;
-    if (Object.keys(updates).length) {
-      console.log('[scrapeEvent] Updating events table with:', updates);
-      await supabase.from('events').update(updates).eq('id', eventId);
-    }
+    if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id', eventId);
 
     // Section scraping for major events
     if (isMajor && sectionNumbers.length > 0) {
-      console.log(`[scrapeEvent] Scraping ${sectionNumbers.length} sections:`, sectionNumbers);
+      console.log('  Scraping '+sectionNumbers.length+' sections...');
+      let postedSections = 0;
 
-      for (const section of sectionNumbers) {
+      for (const secNum of sectionNumbers) {
+        let secPage = null;
         try {
-          const sectionUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0&sections=${encodeURIComponent(section)}`;
-          console.log(`[scrapeEvent] Navigating to section ${section}: ${sectionUrl}`);
-          await navigateTo(page, sectionUrl, SECTION_DELAY_MS);
+          secPage = await page.context().newPage();
+          const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${secNum}&quantity=0`;
+          await navigateTo(secPage, secUrl, SECTION_DELAY_MS);
 
-          console.log('[scrapeEvent] Waiting for ticket list container on section page...');
-          await page.waitForSelector('div[role="button"][data-index]', { timeout: 20000 }).catch(() => {
-            console.warn(`[scrapeEvent] Section ${section}: ticket list container not found within timeout`);
-          });
-
-          console.log('[scrapeEvent] Waiting for ticket rows on section page...');
-          const sectionRowFound = await page.waitForFunction(
-            (sel) => !!document.querySelector(sel),
-            TICKET_ROW_SELECTOR,
-            { timeout: 25000 }
-          ).then(() => true).catch(() => false);
-
-          if (!sectionRowFound) {
-            console.warn(`[scrapeEvent] Section ${section}: ticket row selector not found within extended timeout`);
-            await debugDumpHTML(page, `No rows found for event ${eventId} section ${section}`);
-          } else {
-            console.log(`[scrapeEvent] Section ${section}: ticket rows detected.`);
-          }
-
-          const sectionResult = await extractSectionPrices(page);
-          console.log(`[scrapeEvent] Section ${section} raw result:`, JSON.stringify(sectionResult, null, 2));
-
-          if (sectionResult.error) {
-            console.warn(`    Section ${section}: extractSectionPrices error: ${sectionResult.error}`);
-          }
-
-          const { totalListings: sectionListings, prices: sectionPrices } = sectionResult;
-          const sectionSummary = summarizePrices(sectionPrices);
-
-          if (!sectionSummary.floor) {
-            console.log(`    Section ${section}: no valid prices`);
+          // Verify we're still on the right event page
+          if (!await isEventPage(secPage, eventId)) {
+            console.log('    Section '+secNum+': redirected, skipping');
             continue;
           }
 
-          console.log(`    Section ${section}: ${sectionListings} listings, floor $${sectionSummary.floor}, atp $${sectionSummary.avg}`);
+          // Wait for listings text to appear
+          await Promise.race([
+            secPage.waitForFunction(() => /\d+\s+listings?/i.test(document.body?.innerText||''), {timeout:8000}).catch(()=>{}),
+            sleep(8000)
+          ]);
 
-          await postSnapshot({
-            eventId,
-            eventName: name,
-            eventDate: date,
-            venue,
-            platform: 'StubHub',
-            totalListings,
-            section,
-            sectionListings,
-            eventFloor: summary.floor,
-            eventAvg: summary.avg,
-            eventCeiling: summary.ceiling,
-            sectionFloor: sectionSummary.floor,
-            sectionAvg: sectionSummary.avg,
-            sectionCeiling: sectionSummary.ceiling,
-            source: 'playwright'
+          const secResult = await extractSectionPrices(secPage);
+
+          if (secResult.error) {
+            console.log('    Section '+secNum+': error — '+secResult.error);
+            continue;
+          }
+
+          const { totalListings: secTotal, prices: secPrices } = secResult;
+          const secSummary = summarizePrices(secPrices);
+
+          if (!secSummary.floor) {
+            console.log('    Section '+secNum+': no valid prices');
+            continue;
+          }
+
+          const ok = await postSnapshot({
+            eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
+            totalListings:0, section:'Section '+secNum, sectionListings:secTotal,
+            sectionFloor:secSummary.floor, sectionAvg:secSummary.avg, sectionCeiling:secSummary.ceiling,
+            eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
+            source:'playwright'
           });
+
+          if (ok) {
+            postedSections++;
+            console.log('    Section '+secNum+': '+secTotal+' listings, floor $'+secSummary.floor);
+          }
 
           await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 2000);
         } catch(e) {
-          console.error(`    Section ${section} error:`, e.message);
+          console.error('    Section '+secNum+' failed:', e.message);
+        } finally {
+          if (secPage) { try { await secPage.close(); } catch(_) {} }
         }
       }
-    } else {
-      console.log(`[scrapeEvent] Skipping section-level scraping (is_major=${isMajor}, sections found=${sectionNumbers.length})`);
+      console.log('  Sections posted: '+postedSections+'/'+sectionNumbers.length);
     }
-  } catch(e) {
-    console.error(`[scrapeEvent] Error scraping event ${eventId}:`, e);
-  }
+
+    return { ok:true };
+
+  } catch(e) { console.error('  Failed '+eventId+':', e.message); return null; }
 }
 
 async function main() {
   console.log('VKT Playwright scraper starting...');
 
-  const events = await getEvents();
-  console.log('[main] Events to process:', events.length);
+  const manualId = process.argv[2];
+  let events = manualId
+    ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:true }]
+    : await getEvents();
+  console.log('Events to process: '+events.length);
 
-  if (!events.length) {
-    console.log('[main] No events found for id 160425611');
-    return;
-  }
-
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
-  const page = await context.newPage();
-
-  page.on('console', msg => {
-    if (msg.type() === 'error') console.error('PAGE ERROR:', msg.text());
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-blink-features=AutomationControlled','--disable-dev-shm-usage','--disable-accelerated-2d-canvas','--no-first-run','--no-zygote','--disable-gpu','--window-size=1280,900']
   });
 
+  const context = await browser.newContext({
+    viewport: { width:1280, height:900 },
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+    }
+  });
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+    window.chrome = { runtime: {} };
+  });
+
+  const page = await context.newPage();
+
+  try {
+    await page.goto('https://www.google.com', { waitUntil:'domcontentloaded', timeout:10000 });
+    await randomDelay(1500, 3000);
+  } catch(_) {}
+
+  let scraped=0, skipped=0, failed=0;
+
   for (const event of events) {
-    const eventId = event.id;
-    console.log(`[main] Scraping: ${event.name || eventId} (${eventId})`);
-
-    const recently = await scrapedRecently(eventId);
-    console.log(`[main] scrapedRecently(${eventId}) returned:`, recently);
-
-    await scrapeEvent(page, event);
+    if (!manualId) {
+      const recent = await scrapedRecently(event.id);
+      if (recent) { console.log('Skipping '+event.name+' (recent)'); skipped++; continue; }
+    }
+    console.log('\nScraping: '+event.name+' ('+event.id+')');
+    const result = await scrapeEvent(page, event);
+    if (result) scraped++; else failed++;
     await randomDelay(SCRAPE_DELAY_MS, SCRAPE_DELAY_MS + 3000);
   }
 
   await browser.close();
-  console.log('Done.');
+  console.log('\nDone — scraped:'+scraped+' skipped:'+skipped+' failed:'+failed);
 }
 
-if (require.main === module) {
-  main().catch(e => {
-    console.error('Fatal error:', e);
-    process.exit(1);
-  });
-}
+main().catch(e => { console.error(e); process.exit(1); });

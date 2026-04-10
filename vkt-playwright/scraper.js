@@ -4,12 +4,15 @@ const { createClient } = require('@supabase/supabase-js');
 
 chromium.use(StealthPlugin());
 
+const BRIGHTDATA_API_TOKEN = process.env.BRIGHTDATA_API_TOKEN || 'ac7d557e-67eb-4e04-90ef-56b1db829ab7';
+const WEB_UNLOCKER_ZONE = process.env.WEB_UNLOCKER_ZONE || 'web_unlocker1';
+
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
 const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
 
-const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '8000', 10);
-const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '4000', 10);
+const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '5000', 10);
+const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '3000', 10);
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
 const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 const MIN_PRICE = 10;
@@ -68,39 +71,45 @@ async function postSnapshot(payload) {
   } catch(e) { console.error('  Snapshot error:', e.message); return false; }
 }
 
-async function dismissModals(page) {
-  for (const sel of ['button:has-text("Accept")','button:has-text("Continue")','button:has-text("Close")','button[aria-label="Close"]','[data-testid="close-button"]']) {
-    try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({timeout:600})) { await el.click({timeout:800}); await page.waitForTimeout(400); }
-    } catch(_) {}
+async function fetchWithWebUnlocker(targetUrl) {
+  console.log('  Fetching:', targetUrl);
+  const res = await fetch('https://api.brightdata.com/request', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + BRIGHTDATA_API_TOKEN,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      zone: WEB_UNLOCKER_ZONE,
+      url: targetUrl,
+      format: 'raw'
+    })
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    console.error('  Web Unlocker error:', res.status, text.slice(0, 200));
+    return null;
+  }
+
+  try {
+    const json = JSON.parse(text);
+    const html = json.body || json.html || json.content || null;
+    console.log('  HTML length:', html ? html.length : 0);
+    return html;
+  } catch(_) {
+    // Response may be raw HTML directly
+    console.log('  Raw HTML length:', text.length);
+    return text;
   }
 }
 
-// Check if we landed on the right event page (not a redirect to team/generic page)
-async function isEventPage(page, eventId) {
-  const url = page.url();
-  const title = await page.title();
-  // Must contain the event ID in the URL
-  if (!url.includes(eventId)) return false;
-  // Must NOT be a generic schedule/tickets page
-  if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(title)) return false;
-  return true;
-}
-
-async function navigateTo(page, url, waitMs=4000) {
-  await page.goto(url, { waitUntil:'domcontentloaded', timeout:45000 });
-  await randomDelay(waitMs, waitMs + 2000);
-  await dismissModals(page);
-
-  const title = (await page.title()) || '';
-  const lower = title.toLowerCase();
-  if (!title || lower.includes('just a moment') || lower.includes('access denied')) {
-    console.log('  Challenge page, retrying...');
-    await randomDelay(5000, 8000);
-    await page.reload({ waitUntil:'domcontentloaded', timeout:45000 });
-    await randomDelay(waitMs, waitMs + 2000);
-    await dismissModals(page);
+async function dismissModals(page) {
+  for (const sel of ['button:has-text("Accept")','button:has-text("Continue")','button:has-text("Close")','button[aria-label="Close"]']) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({timeout:500})) { await el.click({timeout:700}); await page.waitForTimeout(300); }
+    } catch(_) {}
   }
 }
 
@@ -155,7 +164,7 @@ async function extractPageData(page) {
     }
     prices.sort((a,b) => a-b);
 
-    // Section numbers from map labels
+    // Section numbers from map
     const sectionNumbers = new Set();
     const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
     for (const line of lines) {
@@ -176,16 +185,16 @@ async function extractSectionPrices(page) {
 
       const bodyText = document.body.innerText || '';
 
-      // Section-specific count from "Section 120 | 3 listings" header
-      const secHeaderMatch = bodyText.match(/Section\s+[\w\d]+\s*[|]\s*(\d[\d,]*)\s+listings?/i);
+      // Section-specific count: "Section 120 | 3 listings"
+      const secHeaderMatch = bodyText.match(/Section\s+[\w\d]+\s*\|\s*(\d[\d,]*)\s+listings?/i);
       let totalListings = secHeaderMatch ? parseInt(secHeaderMatch[1].replace(/,/g,''), 10) : 0;
 
-      // Fallback: smallest "N listings" number (avoids picking up global count)
+      // Fallback: smallest listings number under 500
       if (!totalListings) {
-        const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
+        const matches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
           .map(m => parseInt(m[1].replace(/,/g,''), 10))
           .filter(v => Number.isFinite(v) && v > 0 && v < 500);
-        totalListings = listingMatches.length ? Math.min(...listingMatches) : 0;
+        totalListings = matches.length ? Math.min(...matches) : 0;
       }
 
       const prices = [];
@@ -222,16 +231,13 @@ async function scrapeEvent(page, event) {
 
   try {
     const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
-    await navigateTo(page, url);
+    const html = await fetchWithWebUnlocker(url);
+    if (!html || html.length < 5000) { console.log('  No HTML for '+eventId); return null; }
 
-    // Detect redirect to wrong page
-    if (!await isEventPage(page, eventId)) {
-      console.log('  Redirected to wrong page, skipping '+eventId);
-      return null;
-    }
+    await page.setContent(html, { waitUntil:'domcontentloaded' });
+    await dismissModals(page);
 
     const data = await extractPageData(page);
-
     let name = data.name || originalName;
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
     const venue = data.venue || event.venue || null;
@@ -248,7 +254,7 @@ async function scrapeEvent(page, event) {
       eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
       totalListings, section:null, sectionListings:0,
       eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
-      source:'playwright'
+      source:'brightdata'
     });
 
     const updates = {};
@@ -263,26 +269,18 @@ async function scrapeEvent(page, event) {
       let postedSections = 0;
 
       for (const secNum of sectionNumbers) {
-        let secPage = null;
         try {
-          secPage = await page.context().newPage();
           const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${secNum}&quantity=0`;
-          await navigateTo(secPage, secUrl, SECTION_DELAY_MS);
-
-          // Verify we're still on the right event page
-          if (!await isEventPage(secPage, eventId)) {
-            console.log('    Section '+secNum+': redirected, skipping');
+          const secHtml = await fetchWithWebUnlocker(secUrl);
+          if (!secHtml || secHtml.length < 5000) {
+            console.log('    Section '+secNum+': no HTML');
             continue;
           }
 
-          // Wait for listings text to appear
-          await Promise.race([
-            secPage.waitForFunction(() => /\d+\s+listings?/i.test(document.body?.innerText||''), {timeout:8000}).catch(()=>{}),
-            sleep(8000)
-          ]);
+          await page.setContent(secHtml, { waitUntil:'domcontentloaded' });
+          await dismissModals(page);
 
-          const secResult = await extractSectionPrices(secPage);
-
+          const secResult = await extractSectionPrices(page);
           if (secResult.error) {
             console.log('    Section '+secNum+': error — '+secResult.error);
             continue;
@@ -301,7 +299,7 @@ async function scrapeEvent(page, event) {
             totalListings:0, section:'Section '+secNum, sectionListings:secTotal,
             sectionFloor:secSummary.floor, sectionAvg:secSummary.avg, sectionCeiling:secSummary.ceiling,
             eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
-            source:'playwright'
+            source:'brightdata'
           });
 
           if (ok) {
@@ -309,11 +307,9 @@ async function scrapeEvent(page, event) {
             console.log('    Section '+secNum+': '+secTotal+' listings, floor $'+secSummary.floor);
           }
 
-          await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 2000);
+          await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 1500);
         } catch(e) {
           console.error('    Section '+secNum+' failed:', e.message);
-        } finally {
-          if (secPage) { try { await secPage.close(); } catch(_) {} }
         }
       }
       console.log('  Sections posted: '+postedSections+'/'+sectionNumbers.length);
@@ -335,33 +331,16 @@ async function main() {
 
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-blink-features=AutomationControlled','--disable-dev-shm-usage','--disable-accelerated-2d-canvas','--no-first-run','--no-zygote','--disable-gpu','--window-size=1280,900']
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--no-first-run','--no-zygote','--disable-gpu']
   });
 
   const context = await browser.newContext({
     viewport: { width:1280, height:900 },
     locale: 'en-US',
-    timezoneId: 'America/New_York',
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    extraHTTPHeaders: {
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-    }
-  });
-
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
-    window.chrome = { runtime: {} };
+    timezoneId: 'America/New_York'
   });
 
   const page = await context.newPage();
-
-  try {
-    await page.goto('https://www.google.com', { waitUntil:'domcontentloaded', timeout:10000 });
-    await randomDelay(1500, 3000);
-  } catch(_) {}
 
   let scraped=0, skipped=0, failed=0;
 
@@ -373,7 +352,7 @@ async function main() {
     console.log('\nScraping: '+event.name+' ('+event.id+')');
     const result = await scrapeEvent(page, event);
     if (result) scraped++; else failed++;
-    await randomDelay(SCRAPE_DELAY_MS, SCRAPE_DELAY_MS + 3000);
+    await randomDelay(SCRAPE_DELAY_MS, SCRAPE_DELAY_MS + 2000);
   }
 
   await browser.close();

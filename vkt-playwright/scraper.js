@@ -4,11 +4,12 @@ const { createClient } = require('@supabase/supabase-js');
 
 chromium.use(StealthPlugin());
 
-const SUPABASE_URL =
-  process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
-const SUPABASE_KEY =
-  process.env.SUPABASE_KEY ||
-  'YOUR_SUPABASE_KEY_HERE';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_KEY');
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -18,6 +19,12 @@ function sleep(ms) {
 
 function randomDelay(min, max) {
   return sleep(min + Math.random() * (max - min));
+}
+
+function normalizeText(value) {
+  if (!value) return null;
+  const v = String(value).replace(/\s+/g, ' ').trim();
+  return v || null;
 }
 
 function cleanTitle(text) {
@@ -44,6 +51,22 @@ function slugToTitle(slug) {
     .trim();
 }
 
+function slugify(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^\w\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function buildVenueId(venueName) {
+  const normalized = normalizeText(venueName);
+  if (!normalized) return null;
+  return `stubhub_${slugify(normalized)}`;
+}
+
 async function dismissModals(page) {
   const selectors = [
     'button:has-text("Accept")',
@@ -56,9 +79,9 @@ async function dismissModals(page) {
   for (const sel of selectors) {
     try {
       const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 600 })) {
-        await el.click({ timeout: 800 });
-        await page.waitForTimeout(400);
+      if (await el.isVisible({ timeout: 800 })) {
+        await el.click({ timeout: 1000 });
+        await page.waitForTimeout(500);
       }
     } catch (_) {}
   }
@@ -94,7 +117,6 @@ async function extractEventMeta(page) {
 
         try {
           const parsed = JSON.parse(raw);
-
           const items = Array.isArray(parsed) ? parsed : [parsed];
           for (const item of items) {
             if (item) results.push(item);
@@ -125,33 +147,19 @@ async function extractEventMeta(page) {
       if (!jsonLdVenue && venueName) jsonLdVenue = venueName;
     }
 
-    const h1 = pickText(['h1']);
-    const ogTitle = pickAttr('meta[property="og:title"]', 'content');
-    const title = document.title?.trim() || null;
-    const canonical = pickAttr('link[rel="canonical"]', 'href');
-
-    const venue =
-      pickAttr('meta[property="og:site_name"]', 'content') || jsonLdVenue;
-
     return {
-      h1,
-      ogTitle,
-      title,
-      canonical,
+      h1: pickText(['h1']),
+      ogTitle: pickAttr('meta[property="og:title"]', 'content'),
+      title: document.title?.trim() || null,
+      canonical: pickAttr('link[rel="canonical"]', 'href'),
       jsonLdName,
       jsonLdVenue,
       jsonLdDate,
-      venue,
       url: location.href,
     };
   });
 
-  const candidates = [
-    meta.h1,
-    meta.ogTitle,
-    meta.jsonLdName,
-    meta.title,
-  ]
+  const candidates = [meta.h1, meta.ogTitle, meta.jsonLdName, meta.title]
     .map(cleanTitle)
     .filter(Boolean);
 
@@ -166,12 +174,50 @@ async function extractEventMeta(page) {
   }
 
   return {
-    eventName,
+    eventName: normalizeText(eventName),
     eventDate: meta.jsonLdDate || null,
-    venue: meta.jsonLdVenue || meta.venue || null,
+    venue: normalizeText(meta.jsonLdVenue),
     canonical: meta.canonical || null,
     url: meta.url || null,
-    raw: meta,
+  };
+}
+
+async function getVenueMeta(page) {
+  const venueMeta = await page.evaluate(() => {
+    const text = document.body?.innerText || '';
+
+    const getMeta = (selector, attr) => {
+      const el = document.querySelector(selector);
+      return el?.getAttribute?.(attr)?.trim() || null;
+    };
+
+    return {
+      canonical: getMeta('link[rel="canonical"]', 'href'),
+      bodyText: text,
+      title: document.title || '',
+    };
+  });
+
+  let venueName = null;
+
+  if (venueMeta.bodyText) {
+    const venuePatterns = [
+      /\b([A-Z][A-Za-z0-9&'().\- ]{2,80})\n(?:[A-Z][a-z]+,\s+[A-Z]{2}|[A-Z][a-z]+,\s+[A-Za-z ]+)/,
+      /\bVenue\s*\n?([A-Z][A-Za-z0-9&'().\- ]{2,80})/i,
+    ];
+
+    for (const pattern of venuePatterns) {
+      const match = venueMeta.bodyText.match(pattern);
+      if (match?.[1]) {
+        venueName = match[1].trim();
+        break;
+      }
+    }
+  }
+
+  return {
+    venueName: normalizeText(venueName),
+    canonical: venueMeta.canonical || null,
   };
 }
 
@@ -179,36 +225,182 @@ async function saveEventMapping({
   stubhubEventId,
   eventName,
   eventDate,
-  venue,
-  sourceUrl,
+  venueName,
+  venueId,
 }) {
   if (!stubhubEventId || !eventName) return;
 
-  // Change table/column names to match your DB schema.
   const payload = {
-    stubhub_event_id: String(stubhubEventId),
-    event_name: eventName,
-    event_date: eventDate,
-    venue: venue,
-    source_url: sourceUrl,
-    last_verified_at: new Date().toISOString(),
+    id: String(stubhubEventId),
+    name: eventName,
+    date: eventDate || null,
+    venue: venueName || null,
+    platform: 'stubhub',
+    venue_id: venueId || null,
+    updated_at: new Date().toISOString(),
   };
 
   const { error } = await supabase
-    .from('stubhub_event_map')
-    .upsert(payload, { onConflict: 'stubhub_event_id' });
+    .from('events')
+    .upsert(payload, { onConflict: 'id' });
 
   if (error) {
-    console.error('Supabase upsert error:', error.message);
+    console.error('Supabase event upsert error:', error.message);
   } else {
-    console.log('Saved event mapping:', payload);
+    console.log('Saved event to events table:', payload);
+  }
+}
+
+async function saveVenueSections(rows, venueId, venueName) {
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  if (!venueId) {
+    console.log('No venue_id available, skipping venue_sections save');
+    return;
+  }
+
+  const seen = new Set();
+
+  const cleaned = rows
+    .map((r) => {
+      const zoneId = r.sectionsParam ? String(r.sectionsParam) : null;
+      const sectionName = normalizeText(r.visibleSection);
+
+      if (!zoneId) return null;
+
+      const key = `${venueId}__${zoneId}`;
+      if (seen.has(key)) return null;
+      seen.add(key);
+
+      return {
+        venue_id: String(venueId),
+        venue_name: venueName || null,
+        zone_id: zoneId,
+        section_name: sectionName,
+      };
+    })
+    .filter(Boolean);
+
+  if (cleaned.length === 0) {
+    console.log('No venue sections to save');
+    return;
+  }
+
+  const { error } = await supabase
+    .from('venue_sections')
+    .upsert(cleaned, {
+      onConflict: 'venue_id,zone_id',
+    });
+
+  if (error) {
+    console.error('Venue sections upsert error:', error.message);
+  } else {
+    console.log(`Saved ${cleaned.length} venue sections`);
+  }
+}
+
+async function scrollSeatMap(page) {
+  for (let i = 0; i < 4; i++) {
+    await page.mouse.wheel(0, 600);
+    await page.waitForTimeout(500);
+  }
+
+  try {
+    await page
+      .locator('[sprite-identifier]')
+      .first()
+      .scrollIntoViewIfNeeded({ timeout: 3000 });
+  } catch (_) {}
+}
+
+async function extractSpriteInfo(page) {
+  return await page.evaluate(() => {
+    const els = Array.from(document.querySelectorAll('[sprite-identifier]'));
+
+    return els
+      .map((el) => {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+
+        return {
+          id: el.getAttribute('sprite-identifier'),
+          x: rect.x + rect.width / 2,
+          y: rect.y + rect.height / 2,
+          width: rect.width,
+          height: rect.height,
+          visible:
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== 'hidden' &&
+            style.display !== 'none',
+        };
+      })
+      .filter((x) => x.id);
+  });
+}
+
+async function extractSelectedSectionDetails(page) {
+  return await page.evaluate(() => {
+    const text = document.body?.innerText || '';
+
+    const clean = (value) => {
+      if (!value) return null;
+      return value.replace(/\s+/g, ' ').trim();
+    };
+
+    const sectionMatch =
+      text.match(/(?:^|\n)\s*Section\s+([A-Z0-9\-& ]{1,60})(?:\n|$)/im) ||
+      text.match(/(?:^|\n)\s*Sec(?:tion)?\.?\s*([A-Z0-9\-& ]{1,60})(?:\n|$)/im);
+
+    const rowMatch = text.match(
+      /(?:^|\n)\s*Row\s+([A-Z0-9\-& ]{1,30})(?:\n|$)/im
+    );
+
+    const zoneMatch = text.match(
+      /(?:^|\n)\s*Zone\s+([A-Z0-9\-& ]{1,60})(?:\n|$)/im
+    );
+
+    return {
+      visibleSection: clean(sectionMatch?.[1] || null),
+      visibleRow: clean(rowMatch?.[1] || null),
+      visibleZone: clean(zoneMatch?.[1] || null),
+    };
+  });
+}
+
+async function clickSpriteAndRead(page, sprite) {
+  try {
+    await page.mouse.click(sprite.x, sprite.y);
+    await page.waitForTimeout(1800);
+
+    const currentUrl = page.url();
+    const parsed = new URL(currentUrl);
+    const sectionsParam = parsed.searchParams.get('sections');
+
+    const details = await extractSelectedSectionDetails(page);
+
+    return {
+      spriteId: sprite.id,
+      sectionsParam: sectionsParam || null,
+      visibleSection: details.visibleSection,
+      visibleRow: details.visibleRow,
+      visibleZone: details.visibleZone,
+      clickedUrl: currentUrl,
+    };
+  } catch (error) {
+    return {
+      spriteId: sprite.id,
+      error: error.message,
+    };
   }
 }
 
 async function main() {
-  console.log('VKT debug: click map and capture navigation');
+  console.log('Starting StubHub scraper');
 
-  const eventId = process.argv[2] || '160425611';
+  const eventId = process.argv[2];
+  if (!eventId) {
+    throw new Error('Usage: node scraper.js <stubhub_event_id>');
+  }
 
   const browser = await chromium.launch({
     headless: true,
@@ -248,107 +440,107 @@ async function main() {
     window.chrome = { runtime: {} };
   });
 
-  const capturedUrls = [];
-  context.on('request', (req) => {
-    const u = req.url();
-    if (u.includes(eventId) && u.includes('section')) {
-      capturedUrls.push(u);
-    }
-  });
-
   const page = await context.newPage();
 
-  try {
-    await page.goto('https://www.google.com', {
-      waitUntil: 'domcontentloaded',
-      timeout: 10000,
-    });
-    await randomDelay(1500, 2500);
-  } catch (_) {}
-
-  const url = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
-  console.log('Loading:', url);
-
-  await page.goto(url, {
-    waitUntil: 'domcontentloaded',
-    timeout: 30000,
-  });
-
-  await randomDelay(6000, 8000);
-  await dismissModals(page);
-
-  // Extract the real event metadata from the rendered page.
-  const eventMeta = await extractEventMeta(page);
-  console.log('\n--- Event Meta ---');
-  console.log(JSON.stringify(eventMeta, null, 2));
-
-  // Save mapping if you want it in Supabase.
-  await saveEventMapping({
-    stubhubEventId: eventId,
-    eventName: eventMeta.eventName,
-    eventDate: eventMeta.eventDate,
-    venue: eventMeta.venue,
-    sourceUrl: eventMeta.canonical || eventMeta.url,
-  });
-
-  // Existing sprite capture logic
-  const spriteInfo = await page.evaluate(() => {
-    const els = Array.from(document.querySelectorAll('[sprite-identifier]'));
-    return els.slice(0, 10).map((el) => {
-      const rect = el.getBoundingClientRect();
-      return {
-        id: el.getAttribute('sprite-identifier'),
-        x: rect.x + rect.width / 2,
-        y: rect.y + rect.height / 2,
-        visible: rect.width > 0 && rect.height > 0,
-      };
-    });
-  });
-
-  console.log('\nSprite elements:', JSON.stringify(spriteInfo.slice(0, 5)));
-
-  const sectionMap = [];
-  for (const sprite of spriteInfo
-    .filter((s) => s.visible && s.x > 0 && s.y > 0)
-    .slice(0, 5)) {
-    try {
-      console.log('\nClicking sprite:', sprite.id, 'at', sprite.x, sprite.y);
-      await page.mouse.click(sprite.x, sprite.y);
-      await sleep(2000);
-
-      const currentUrl = page.url();
-      console.log('URL after click:', currentUrl);
-
-      const sectionsParam = new URL(currentUrl).searchParams.get('sections');
-      if (sectionsParam) {
-        sectionMap.push({ spriteId: sprite.id, sectionsParam });
-        console.log('  sections param:', sectionsParam);
-      }
-
-      const secText = await page.evaluate(() => {
-        const bodyText = document.body?.innerText || '';
-        const match = bodyText.match(/Section\s+([A-Z0-9-]+)/i);
-        return match ? match[0] : null;
-      });
-
-      if (secText) {
-        console.log('  section text on page:', secText);
-      }
-    } catch (e) {
-      console.log('Click failed:', e.message);
+  const capturedUrls = [];
+  context.on('request', (req) => {
+    const url = req.url();
+    if (url.includes(String(eventId)) && url.includes('section')) {
+      capturedUrls.push(url);
     }
+  });
+
+  try {
+    try {
+      await page.goto('https://www.google.com', {
+        waitUntil: 'domcontentloaded',
+        timeout: 10000,
+      });
+      await randomDelay(1500, 2500);
+    } catch (_) {}
+
+    const url = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
+    console.log('Loading:', url);
+
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+
+    await randomDelay(6000, 8000);
+    await dismissModals(page);
+
+    const eventMeta = await extractEventMeta(page);
+    const venueMeta = await getVenueMeta(page);
+
+    const venueName = normalizeText(eventMeta.venue || venueMeta.venueName);
+    const venueId = buildVenueId(venueName);
+
+    console.log('\n--- Event Meta ---');
+    console.log(
+      JSON.stringify(
+        {
+          ...eventMeta,
+          derivedVenueId: venueId,
+          derivedVenueName: venueName,
+        },
+        null,
+        2
+      )
+    );
+
+    await saveEventMapping({
+      stubhubEventId: eventId,
+      eventName: eventMeta.eventName,
+      eventDate: eventMeta.eventDate,
+      venueName,
+      venueId,
+    });
+
+    await scrollSeatMap(page);
+
+    const spriteInfo = await extractSpriteInfo(page);
+
+    console.log('\nVisible sprites found:', spriteInfo.length);
+    console.log(JSON.stringify(spriteInfo.slice(0, 5), null, 2));
+
+    const sectionMap = [];
+
+    for (const sprite of spriteInfo
+      .filter((s) => s.visible && s.x > 0 && s.y > 0)
+      .slice(0, 20)) {
+      console.log(`\nClicking sprite ${sprite.id} at ${sprite.x}, ${sprite.y}`);
+
+      const result = await clickSpriteAndRead(page, sprite);
+      sectionMap.push(result);
+
+      if (result.error) {
+        console.log('Click failed:', result.error);
+        continue;
+      }
+
+      console.log('Clicked URL:', result.clickedUrl);
+      console.log('sections param:', result.sectionsParam);
+      console.log('visible section:', result.visibleSection);
+      console.log('visible row:', result.visibleRow);
+      console.log('visible zone:', result.visibleZone);
+
+      await page.waitForTimeout(1000);
+    }
+
+    console.log('\n--- Section Map ---');
+    console.log(JSON.stringify(sectionMap, null, 2));
+
+    console.log('\n--- Captured Section URLs ---');
+    capturedUrls.forEach((u) => console.log(u.slice(0, 250)));
+
+    await saveVenueSections(sectionMap, venueId, venueName);
+  } finally {
+    await browser.close();
   }
-
-  console.log('\n--- Section ID map ---');
-  sectionMap.forEach((m) => console.log(m.spriteId, '->', m.sectionsParam));
-
-  console.log('\n--- Captured section URLs ---');
-  capturedUrls.forEach((u) => console.log(u.slice(0, 200)));
-
-  await browser.close();
 }
 
-main().catch((e) => {
-  console.error(e);
+main().catch((error) => {
+  console.error(error);
   process.exit(1);
 });

@@ -10,13 +10,12 @@ const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
 
 const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '8000', 10);
 const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '4000', 10);
-// RECENT_HOURS is ignored now because we force scraping
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
 // Ticket row selector for StubHub (from your HTML snippet)
-const TICKET_ROW_SELECTOR = 'div[data-listing-id]';
+const TICKET_ROW_SELECTOR = 'div[role="button"][data-index][data-listing-id]';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -130,6 +129,18 @@ async function navigateTo(page, url, waitMs=4000) {
     await page.reload({ waitUntil:'domcontentloaded', timeout:45000 });
     await randomDelay(waitMs, waitMs + 2000);
     await dismissModals(page);
+  }
+}
+
+// Debug helper: dump first part of HTML Playwright sees
+async function debugDumpHTML(page, label) {
+  try {
+    const html = await page.content();
+    console.log(`\n[debugDumpHTML] ===== ${label} =====`);
+    console.log(html.slice(0, 5000)); // first 5k chars
+    console.log('[debugDumpHTML] ===== END =====\n');
+  } catch (e) {
+    console.error('[debugDumpHTML] Error:', e.message);
   }
 }
 
@@ -249,10 +260,29 @@ async function scrapeEvent(page, event) {
     const url = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
     await navigateTo(page, url, SCRAPE_DELAY_MS);
 
-    console.log('[scrapeEvent] Waiting for ticket rows selector:', TICKET_ROW_SELECTOR);
-    await page.waitForSelector(TICKET_ROW_SELECTOR, { timeout:15000 }).catch(() => {
-      console.warn('[scrapeEvent] Ticket row selector not found within timeout');
+    // Debug: see what HTML we have right after navigation
+    await debugDumpHTML(page, `After navigateTo for event ${eventId}`);
+
+    // 1) Wait for a generic ticket list container
+    console.log('[scrapeEvent] Waiting for ticket list container (div[role="button"][data-index])...');
+    await page.waitForSelector('div[role="button"][data-index]', { timeout: 20000 }).catch(() => {
+      console.warn('[scrapeEvent] Ticket list container not found within timeout');
     });
+
+    // 2) Then wait/poll specifically for ticket rows
+    console.log('[scrapeEvent] Waiting for ticket rows selector:', TICKET_ROW_SELECTOR);
+    const rowFound = await page.waitForFunction(
+      (sel) => !!document.querySelector(sel),
+      TICKET_ROW_SELECTOR,
+      { timeout: 25000 }
+    ).then(() => true).catch(() => false);
+
+    if (!rowFound) {
+      console.warn('[scrapeEvent] Ticket row selector not found within extended timeout');
+      await debugDumpHTML(page, `No rows found for event ${eventId}`);
+    } else {
+      console.log('[scrapeEvent] Ticket rows detected.');
+    }
 
     const data = await extractPageData(page);
     console.log('[scrapeEvent] Raw extractPageData result:', JSON.stringify(data, null, 2));
@@ -308,10 +338,24 @@ async function scrapeEvent(page, event) {
           console.log(`[scrapeEvent] Navigating to section ${section}: ${sectionUrl}`);
           await navigateTo(page, sectionUrl, SECTION_DELAY_MS);
 
-          console.log('[scrapeEvent] Waiting for ticket rows on section page...');
-          await page.waitForSelector(TICKET_ROW_SELECTOR, { timeout:15000 }).catch(() => {
-            console.warn(`[scrapeEvent] Section ${section}: ticket row selector not found within timeout`);
+          console.log('[scrapeEvent] Waiting for ticket list container on section page...');
+          await page.waitForSelector('div[role="button"][data-index]', { timeout: 20000 }).catch(() => {
+            console.warn(`[scrapeEvent] Section ${section}: ticket list container not found within timeout`);
           });
+
+          console.log('[scrapeEvent] Waiting for ticket rows on section page...');
+          const sectionRowFound = await page.waitForFunction(
+            (sel) => !!document.querySelector(sel),
+            TICKET_ROW_SELECTOR,
+            { timeout: 25000 }
+          ).then(() => true).catch(() => false);
+
+          if (!sectionRowFound) {
+            console.warn(`[scrapeEvent] Section ${section}: ticket row selector not found within extended timeout`);
+            await debugDumpHTML(page, `No rows found for event ${eventId} section ${section}`);
+          } else {
+            console.log(`[scrapeEvent] Section ${section}: ticket rows detected.`);
+          }
 
           const sectionResult = await extractSectionPrices(page);
           console.log(`[scrapeEvent] Section ${section} raw result:`, JSON.stringify(sectionResult, null, 2));
@@ -384,7 +428,6 @@ async function main() {
     const eventId = event.id;
     console.log(`[main] Scraping: ${event.name || eventId} (${eventId})`);
 
-    // Forced: do not skip for "recently scraped"
     const recently = await scrapedRecently(eventId);
     console.log(`[main] scrapedRecently(${eventId}) returned:`, recently);
 

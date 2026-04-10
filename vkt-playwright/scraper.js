@@ -88,7 +88,7 @@ async function navigateTo(page, url, waitMs=4000) {
 }
 
 async function extractPageData(page) {
-  return await page.evaluate((minPrice, maxPrice) => {
+  return await page.evaluate(({minPrice, maxPrice}) => {
     // Event metadata from JSON-LD
     let name = null, date = null, venue = null;
     const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
@@ -148,11 +148,11 @@ async function extractPageData(page) {
     }
 
     return { name, date, venue, totalListings, prices, sectionNumbers: Array.from(sectionNumbers) };
-  }, MIN_PRICE, MAX_PRICE);
+  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
 }
 
 async function extractSectionPrices(page, eventTotalListings) {
-  return await page.evaluate((minPrice, maxPrice, eventTotal) => {
+  return await page.evaluate(({minPrice, maxPrice, eventTotal}) => {
     const bodyText = document.body?.innerText || '';
     const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
       .map(m => parseInt(m[1].replace(/,/g,''), 10))
@@ -174,7 +174,7 @@ async function extractSectionPrices(page, eventTotalListings) {
     }
     prices.sort((a,b) => a-b);
     return { totalListings, prices };
-  }, MIN_PRICE, MAX_PRICE, eventTotalListings);
+  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE, eventTotal: eventTotalListings});
 }
 
 async function scrapeEvent(page, event) {

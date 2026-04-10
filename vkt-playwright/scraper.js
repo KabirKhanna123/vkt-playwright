@@ -11,10 +11,9 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.s
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
 const VKT_API      = process.env.VKT_API      || 'https://vkt-volume-api.vercel.app';
 
-const SCRAPE_DELAY_MS  = parseInt(process.env.SCRAPE_DELAY_MS  || '5000', 10);
-const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '3000', 10);
-const RECENT_HOURS     = parseInt(process.env.RECENT_HOURS     || '20',   10);
-const EVENT_LIMIT      = parseInt(process.env.EVENT_LIMIT      || '200',  10);
+const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '5000', 10);
+const RECENT_HOURS    = parseInt(process.env.RECENT_HOURS    || '20',   10);
+const EVENT_LIMIT     = parseInt(process.env.EVENT_LIMIT     || '200',  10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
@@ -46,10 +45,8 @@ function summarizePrices(prices) {
   };
 }
 
-// Build SEO URL from event data as fallback
-function buildStubHubUrl(event, suffix='?quantity=0') {
+function buildStubHubUrl(event) {
   const eventId = event.id;
-
   if (event.name && event.date) {
     try {
       const nameSlug = event.name
@@ -69,27 +66,45 @@ function buildStubHubUrl(event, suffix='?quantity=0') {
 
       const d = new Date(event.date + 'T12:00:00');
       const dateSlug = `${d.getMonth()+1}-${d.getDate()}-${d.getFullYear()}`;
-
       const slug = citySlug
         ? `${nameSlug}-${citySlug}-tickets-${dateSlug}`
         : `${nameSlug}-tickets-${dateSlug}`;
 
-      return `https://www.stubhub.com/${slug}/event/${eventId}/${suffix}`;
+      return `https://www.stubhub.com/${slug}/event/${eventId}/?quantity=0`;
     } catch(_) {}
   }
-
-  return `https://www.stubhub.com/event/${eventId}/?${suffix.replace(/^\?/,'')}`;
+  return `https://www.stubhub.com/event/${eventId}/?quantity=0`;
 }
 
-// Get the best URL to use for an event
-function getEventUrl(event, suffix='?quantity=0') {
-  // Use stored stubhub_url if available — most reliable
+function getEventUrl(event) {
   if (event.stubhub_url) {
     const base = event.stubhub_url.split('?')[0].replace(/\/$/, '');
-    return base + '/' + suffix.replace(/^\?/, '?');
+    return base + '/?quantity=0';
   }
-  // Fall back to building from name/venue/date
-  return buildStubHubUrl(event, suffix);
+  return buildStubHubUrl(event);
+}
+
+function extractCanonicalUrl(html, eventId) {
+  const ogMatch = html.match(/<meta[^>]+property="og:url"[^>]+content="([^"]+)"/i)
+    || html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:url"/i);
+  if (ogMatch && ogMatch[1].includes(eventId)) return ogMatch[1].split('?')[0];
+
+  const canonMatch = html.match(/<link[^>]+rel="canonical"[^>]+href="([^"]+)"/i)
+    || html.match(/<link[^>]+href="([^"]+)"[^>]+rel="canonical"/i);
+  if (canonMatch && canonMatch[1].includes(eventId)) return canonMatch[1].split('?')[0];
+
+  return null;
+}
+
+function isCorrectEventPage(html, eventId) {
+  if (!html || html.length < 5000) return false;
+  if (!html.includes(eventId)) return false;
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+  if (titleMatch && /Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(titleMatch[1])) {
+    console.log('  Wrong page:', titleMatch[1].slice(0, 80));
+    return false;
+  }
+  return true;
 }
 
 async function getEvents() {
@@ -160,32 +175,6 @@ async function fetchWithWebUnlocker(targetUrl) {
   return text;
 }
 
-// Extract the actual canonical URL from the HTML (StubHub includes it in og:url or canonical)
-function extractCanonicalUrl(html, eventId) {
-  // Try og:url first
-  const ogMatch = html.match(/<meta[^>]+property="og:url"[^>]+content="([^"]+)"/i)
-    || html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:url"/i);
-  if (ogMatch && ogMatch[1].includes(eventId)) return ogMatch[1].split('?')[0];
-
-  // Try canonical link
-  const canonMatch = html.match(/<link[^>]+rel="canonical"[^>]+href="([^"]+)"/i)
-    || html.match(/<link[^>]+href="([^"]+)"[^>]+rel="canonical"/i);
-  if (canonMatch && canonMatch[1].includes(eventId)) return canonMatch[1].split('?')[0];
-
-  return null;
-}
-
-function isCorrectEventPage(html, eventId) {
-  if (!html || html.length < 5000) return false;
-  if (!html.includes(eventId)) return false;
-  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-  if (titleMatch && /Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(titleMatch[1])) {
-    console.log('  Wrong page title:', titleMatch[1].slice(0, 80));
-    return false;
-  }
-  return true;
-}
-
 async function dismissModals(page) {
   for (const sel of ['button:has-text("Accept")','button:has-text("Continue")','button:has-text("Close")','button[aria-label="Close"]']) {
     try {
@@ -244,90 +233,33 @@ async function extractPageData(page) {
     }
     prices.sort((a,b) => a-b);
 
-    const sectionNumbers = new Set();
-    const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    for (const line of lines) {
-      if (/^\d{2,3}[A-Z]?$/.test(line)) {
-        const n = parseInt(line, 10);
-        if (n >= 100 && n <= 599) sectionNumbers.add(line.trim());
-      }
-    }
-
-    return { name, date, venue, totalListings, prices, sectionNumbers: Array.from(sectionNumbers) };
-  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
-}
-
-async function extractSectionPrices(page) {
-  return await page.evaluate(({minPrice, maxPrice}) => {
-    try {
-      if (!document || !document.body) return { totalListings:0, prices:[], error:'no-body' };
-      const bodyText = document.body.innerText || '';
-
-      const secHeaderMatch = bodyText.match(/Section\s+[\w\d]+\s*\|\s*(\d[\d,]*)\s+listings?/i);
-      let totalListings = secHeaderMatch ? parseInt(secHeaderMatch[1].replace(/,/g,''), 10) : 0;
-
-      if (!totalListings) {
-        const matches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
-          .map(m => parseInt(m[1].replace(/,/g,''), 10))
-          .filter(v => Number.isFinite(v) && v > 0 && v < 500);
-        totalListings = matches.length ? Math.min(...matches) : 0;
-      }
-
-      const prices = [];
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      let node;
-      while ((node = walker.nextNode())) {
-        try {
-          if (!node.parentElement) continue;
-          if (node.parentElement.closest('script,style,noscript,svg')) continue;
-          let style;
-          try { style = window.getComputedStyle(node.parentElement); } catch { continue; }
-          if (!style || style.display === 'none' || style.visibility === 'hidden') continue;
-          const text = node.textContent || '';
-          if (!text.includes('$')) continue;
-          for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-            const value = parseFloat(match[1].replace(/,/g,''));
-            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
-          }
-        } catch { continue; }
-      }
-
-      prices.sort((a,b) => a-b);
-      return { totalListings, prices, error:null };
-    } catch(e) {
-      return { totalListings:0, prices:[], error: e?.message || 'unknown' };
-    }
+    return { name, date, venue, totalListings, prices };
   }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
 }
 
 async function scrapeEvent(page, event) {
   const eventId = event.id;
   const originalName = event.name || 'Event '+eventId;
-  const isMajor = event.is_major === true;
 
   try {
-    // Use stored URL if available, otherwise build/guess
     const primaryUrl = getEventUrl(event);
-    console.log('  URL:', primaryUrl);
     let html = await fetchWithWebUnlocker(primaryUrl);
     let usedUrl = primaryUrl;
 
-    // If wrong page, try short URL as fallback
     if (!isCorrectEventPage(html, eventId)) {
       const shortUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
       if (shortUrl !== primaryUrl) {
-        console.log('  Primary URL failed, trying short URL...');
+        console.log('  Trying short URL...');
         html = await fetchWithWebUnlocker(shortUrl);
         usedUrl = shortUrl;
       }
     }
 
     if (!isCorrectEventPage(html, eventId)) {
-      console.log('  Could not get correct page for '+eventId+', skipping');
+      console.log('  Could not get correct page, skipping');
       return null;
     }
 
-    // Extract canonical URL from HTML and save it for future use
     const canonicalUrl = extractCanonicalUrl(html, eventId);
 
     await page.setContent(html, { waitUntil:'domcontentloaded' });
@@ -338,13 +270,13 @@ async function scrapeEvent(page, event) {
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
     const venue = data.venue || event.venue || null;
     const date = normalizeDateString(data.date) || event.date || null;
-    const { totalListings, prices, sectionNumbers } = data;
+    const { totalListings, prices } = data;
 
     const summary = summarizePrices(prices);
     if (!summary.floor) { console.log('  No pricing for '+name); return null; }
 
     console.log('  '+name+' | '+date+' | '+venue);
-    console.log('  '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg+(isMajor?' [MAJOR]':''));
+    console.log('  '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg);
 
     await postSnapshot({
       eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
@@ -353,58 +285,15 @@ async function scrapeEvent(page, event) {
       source:'brightdata'
     });
 
-    // Save all improvements back to events table
+    // Save improvements back to events table
     const updates = {};
     if (name !== originalName) updates.name = name;
     if (venue && venue !== event.venue) updates.venue = venue;
     if (date && date !== event.date) updates.date = date;
-    // Save canonical URL so future scrapes use it directly
     if (canonicalUrl && canonicalUrl !== event.stubhub_url) {
       updates.stubhub_url = canonicalUrl;
-      console.log('  Saved canonical URL:', canonicalUrl);
     }
     if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id', eventId);
-
-    // Section scraping for major events
-    if (isMajor && sectionNumbers.length > 0) {
-      console.log('  Scraping '+sectionNumbers.length+' sections...');
-      let postedSections = 0;
-
-      for (const secNum of sectionNumbers) {
-        try {
-          // Use canonical URL base for section URLs if available
-          const baseUrl = canonicalUrl || (event.stubhub_url ? event.stubhub_url.split('?')[0].replace(/\/$/, '') : null);
-          const secUrl = baseUrl
-            ? `${baseUrl}/?sections=${secNum}&quantity=0`
-            : `https://www.stubhub.com/event/${eventId}/?sections=${secNum}&quantity=0`;
-
-          const secHtml = await fetchWithWebUnlocker(secUrl);
-          if (!secHtml || secHtml.length < 5000) { console.log('    Section '+secNum+': no HTML'); continue; }
-
-          await page.setContent(secHtml, { waitUntil:'domcontentloaded' });
-          await dismissModals(page);
-
-          const secResult = await extractSectionPrices(page);
-          if (secResult.error) { console.log('    Section '+secNum+': error — '+secResult.error); continue; }
-
-          const { totalListings: secTotal, prices: secPrices } = secResult;
-          const secSummary = summarizePrices(secPrices);
-          if (!secSummary.floor) { console.log('    Section '+secNum+': no valid prices'); continue; }
-
-          const ok = await postSnapshot({
-            eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
-            totalListings:0, section:'Section '+secNum, sectionListings:secTotal,
-            sectionFloor:secSummary.floor, sectionAvg:secSummary.avg, sectionCeiling:secSummary.ceiling,
-            eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
-            source:'brightdata'
-          });
-
-          if (ok) { postedSections++; console.log('    Section '+secNum+': '+secTotal+' listings, floor $'+secSummary.floor); }
-          await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 1500);
-        } catch(e) { console.error('    Section '+secNum+' failed:', e.message); }
-      }
-      console.log('  Sections posted: '+postedSections+'/'+sectionNumbers.length);
-    }
 
     return { ok:true };
 
@@ -416,7 +305,7 @@ async function main() {
 
   const manualId = process.argv[2];
   let events = manualId
-    ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:true, stubhub_url:null }]
+    ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:false, stubhub_url:null }]
     : await getEvents();
   console.log('Events to process: '+events.length);
 

@@ -6,65 +6,11 @@ chromium.use(StealthPlugin());
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
-const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
-
-const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '8000', 10);
-const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '3000', 10);
-const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
-const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function randomDelay(min, max) { return sleep(min + Math.random() * (max - min)); }
-function safeNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
-
-function normalizeDateString(value) {
-  if (!value) return null;
-  const s = String(value).trim();
-  const isoMatch = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
-  if (isoMatch) return isoMatch[1];
-  const d = new Date(s);
-  if (!isNaN(d.getTime())) {
-    return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
-  }
-  return null;
-}
-
-function summarizePrices(prices) {
-  const valid = (prices||[]).map(safeNum).filter(v => v>0 && v<25000).sort((a,b)=>a-b);
-  if (!valid.length) return { floor:null, avg:null, ceiling:null };
-  return {
-    floor: Math.round(valid[0]),
-    avg: Math.round(valid.reduce((a,b)=>a+b,0)/valid.length),
-    ceiling: Math.round(valid[valid.length-1])
-  };
-}
-
-async function getEvents() {
-  const { data, error } = await supabase
-    .from('events')
-    .select('id,name,date,venue,platform,is_major')
-    .not('id','like','tm_%')
-    .order('date',{ascending:true})
-    .limit(EVENT_LIMIT);
-  if (error) { console.error('Failed to fetch events:', error.message); return []; }
-  return data || [];
-}
-
-async function scrapedRecently(eventId, hours=RECENT_HOURS) {
-  const since = new Date(Date.now() - hours*3600000).toISOString();
-  const { data } = await supabase.from('volume_snapshots').select('id').eq('event_id',eventId).is('section',null).gte('scraped_at',since).limit(1);
-  return !!(data && data.length > 0);
-}
-
-async function postSnapshot(payload) {
-  try {
-    const r = await fetch(VKT_API+'/api/snapshot', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
-    if (!r.ok) { console.error('  Snapshot failed:', r.status, await r.text()); return false; }
-    return true;
-  } catch(e) { console.error('  Snapshot error:', e.message); return false; }
-}
 
 async function dismissModals(page) {
   for (const sel of ['button:has-text("Accept")','button:has-text("Continue")','button:has-text("Close")','button[aria-label="Close"]','[data-testid="close-button"]']) {
@@ -75,198 +21,14 @@ async function dismissModals(page) {
   }
 }
 
-async function navigateTo(page, url, waitMs = 4000) {
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await randomDelay(waitMs, waitMs + 2000);
-  await dismissModals(page);
-  const title = await page.title();
-  if (!title || title.toLowerCase().includes('just a moment')) {
-    await randomDelay(5000, 8000);
-  }
-}
-
-async function extractPageData(page) {
-  return await page.evaluate(() => {
-    // Event metadata from JSON-LD
-    let name = null, date = null, venue = null;
-    const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
-    for (const script of scripts) {
-      try {
-        const parsed = JSON.parse(script.textContent);
-        const items = Array.isArray(parsed) ? parsed : [parsed];
-        for (const item of items) {
-          if (!item || typeof item !== 'object') continue;
-          if (item['@type'] !== 'Event' && item['@type'] !== 'SportsEvent') continue;
-          if (!name && item.name && !item.name.toLowerCase().includes('tickets')) name = item.name;
-          if (!date && item.startDate) date = item.startDate;
-          if (!venue && item.location?.name) {
-            const city = item.location.address?.addressLocality || '';
-            const state = item.location.address?.addressRegion || '';
-            venue = [item.location.name, city, state].filter(Boolean).join(', ');
-          }
-          if (name && date && venue) break;
-        }
-      } catch(_) {}
-      if (name && date && venue) break;
-    }
-
-    // Listing count and prices from visible text
-    const bodyText = document.body?.innerText || '';
-    const listingMatches = [...bodyText.matchAll(/(\d[\d,]*)\s+listings?/gi)]
-      .map(m => parseInt(m[1].replace(/,/g,''), 10))
-      .filter(v => Number.isFinite(v) && v >= 0);
-    const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
-
-    const prices = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      if (!node.parentElement) continue;
-      if (node.parentElement.closest('script,style,noscript,svg')) continue;
-      const style = window.getComputedStyle(node.parentElement);
-      if (style.display === 'none' || style.visibility === 'hidden') continue;
-      for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-        const value = parseFloat(match[1].replace(/,/g,''));
-        if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
-      }
-    }
-    prices.sort((a,b) => a - b);
-
-    // Extract section numbers from the map labels
-    // These appear as standalone numbers (103, 104, 237, etc.) in the SVG/map area
-    const sectionNumbers = new Set();
-    const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    for (const line of lines) {
-      // Match standalone 2-3 digit numbers that look like section numbers (100-599)
-      if (/^\d{2,3}[A-Z]?$/.test(line)) {
-        const n = parseInt(line, 10);
-        if (n >= 100 && n <= 599) sectionNumbers.add(line.trim());
-      }
-    }
-
-    return { name, date, venue, totalListings, prices, sectionNumbers: Array.from(sectionNumbers) };
-  });
-}
-
-async function extractSectionPrices(page, eventTotalListings) {
-  return await page.evaluate((eventTotal) => {
-    const bodyText = document.body?.innerText || '';
-    const listingMatches = [...bodyText.matchAll(/(\d[\d,]*)\s+listings?/gi)]
-      .map(m => parseInt(m[1].replace(/,/g,''), 10))
-      .filter(v => Number.isFinite(v) && v >= 0);
-    const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
-
-    const prices = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      if (!node.parentElement) continue;
-      if (node.parentElement.closest('script,style,noscript,svg')) continue;
-      const style = window.getComputedStyle(node.parentElement);
-      if (style.display === 'none' || style.visibility === 'hidden') continue;
-      for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-        const value = parseFloat(match[1].replace(/,/g,''));
-        if (Number.isFinite(value) && value >= 1 && value <= 25000) prices.push(value);
-      }
-    }
-    prices.sort((a,b) => a - b);
-    return { totalListings, prices };
-  }, eventTotalListings);
-}
-
-async function scrapeEvent(page, event) {
-  const eventId = event.id;
-  const originalName = event.name || 'Event '+eventId;
-  const isMajor = event.is_major === true;
-
-  try {
-    const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
-    await navigateTo(page, url);
-    const data = await extractPageData(page);
-
-    let name = data.name || originalName;
-    if (name && name.toLowerCase().includes('tickets')) name = originalName;
-    const venue = data.venue || event.venue || null;
-    const date = normalizeDateString(data.date) || event.date || null;
-    const { totalListings, prices, sectionNumbers } = data;
-
-    const summary = summarizePrices(prices);
-    if (!summary.floor) { console.log('  No pricing for '+name); return null; }
-
-    console.log('  '+name+' | '+date+' | '+venue);
-    console.log('  '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg+(isMajor ? ' [MAJOR]' : ''));
-
-    await postSnapshot({
-      eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
-      totalListings, section:null, sectionListings:0,
-      eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
-      source:'playwright'
-    });
-
-    const updates = {};
-    if (name !== originalName) updates.name = name;
-    if (venue && venue !== event.venue) updates.venue = venue;
-    if (date && date !== event.date) updates.date = date;
-    if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id',eventId);
-
-    // Section scraping for major events
-    if (isMajor) {
-      console.log('  Map sections found: '+sectionNumbers.length+' — '+sectionNumbers.slice(0,8).join(', ')+(sectionNumbers.length > 8 ? '...' : ''));
-
-      if (sectionNumbers.length > 0) {
-        let postedSections = 0;
-        for (const secNum of sectionNumbers) {
-          try {
-            const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${secNum}&quantity=0`;
-            await navigateTo(page, secUrl, SECTION_DELAY_MS);
-            const secData = await extractSectionPrices(page, totalListings);
-
-            const secTotal = secData.totalListings;
-            if (!secTotal || secTotal === totalListings) continue;
-
-            const secSummary = summarizePrices(secData.prices);
-            if (!secSummary.floor) continue;
-
-            const sectionName = 'Section '+secNum;
-            const ok = await postSnapshot({
-              eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
-              totalListings:0, section:sectionName, sectionListings:secTotal,
-              sectionFloor:secSummary.floor, sectionAvg:secSummary.avg, sectionCeiling:secSummary.ceiling,
-              eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
-              source:'playwright'
-            });
-
-            if (ok) {
-              postedSections++;
-              console.log('    Section '+secNum+': '+secTotal+' listings, floor $'+secSummary.floor);
-            }
-
-            await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 1500);
-          } catch(e) { console.error('    Section '+secNum+' failed:', e.message); continue; }
-        }
-        console.log('  Sections posted: '+postedSections+'/'+sectionNumbers.length);
-      } else {
-        console.log('  No section numbers found in map');
-      }
-    }
-
-    return { ok:true };
-
-  } catch(e) { console.error('  Failed '+eventId+':', e.message); return null; }
-}
-
 async function main() {
-  console.log('VKT Playwright scraper starting...');
+  console.log('VKT debug: find section ID mapping');
 
-  const manualId = process.argv[2];
-  let events = manualId
-    ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:true }]
-    : await getEvents();
-  console.log('Events to process: '+events.length);
+  const eventId = process.argv[2] || '160425611';
 
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-blink-features=AutomationControlled','--disable-dev-shm-usage','--disable-accelerated-2d-canvas','--no-first-run','--no-zygote','--disable-gpu','--window-size=1280,900']
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-blink-features=AutomationControlled','--disable-dev-shm-usage','--no-first-run','--no-zygote','--disable-gpu','--window-size=1280,900']
   });
 
   const context = await browser.newContext({
@@ -274,10 +36,7 @@ async function main() {
     locale: 'en-US',
     timezoneId: 'America/New_York',
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    extraHTTPHeaders: {
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-    }
+    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
   });
 
   await context.addInitScript(() => {
@@ -287,28 +46,97 @@ async function main() {
     window.chrome = { runtime: {} };
   });
 
+  // Intercept all XHR/fetch requests to find section API calls
+  const sectionRequests = [];
+  context.on('request', request => {
+    const url = request.url();
+    if (url.includes('sections=') || url.includes('section') && url.includes(eventId)) {
+      sectionRequests.push(url);
+    }
+  });
+
   const page = await context.newPage();
 
-  try {
-    await page.goto('https://www.google.com', { waitUntil:'domcontentloaded', timeout:10000 });
-    await randomDelay(1500, 3000);
-  } catch(_) {}
+  try { await page.goto('https://www.google.com', { waitUntil:'domcontentloaded', timeout:10000 }); await randomDelay(1500,2500); } catch(_) {}
 
-  let scraped=0, skipped=0, failed=0;
+  const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
+  console.log('Loading:', url);
+  await page.goto(url, { waitUntil:'domcontentloaded', timeout:30000 });
+  await randomDelay(5000, 7000);
+  await dismissModals(page);
 
-  for (const event of events) {
-    if (!manualId) {
-      const recent = await scrapedRecently(event.id);
-      if (recent) { console.log('Skipping '+event.name+' (recent)'); skipped++; continue; }
+  // Search all script tags for section ID mappings
+  const sectionMapping = await page.evaluate(() => {
+    const results = [];
+    const scripts = Array.from(document.querySelectorAll('script'));
+    for (const script of scripts) {
+      const content = script.textContent || '';
+      // Look for patterns like "sectionId":194578,"name":"129" or similar
+      if (content.includes('194') && content.includes('section')) {
+        // Try to find JSON with sectionId + name pairs
+        const matches = [...content.matchAll(/"(?:sectionId|id)"\s*:\s*(\d{5,})[^}]*?"(?:name|sectionName|label)"\s*:\s*"([^"]+)"/g)];
+        for (const m of matches) {
+          results.push({ id: m[1], name: m[2], source: 'script' });
+        }
+        // Also try reversed
+        const matches2 = [...content.matchAll(/"(?:name|sectionName|label)"\s*:\s*"([^"]+)"[^}]*?"(?:sectionId|id)"\s*:\s*(\d{5,})/g)];
+        for (const m of matches2) {
+          results.push({ id: m[2], name: m[1], source: 'script-rev' });
+        }
+      }
     }
-    console.log('\nScraping: '+event.name+' ('+event.id+')');
-    const result = await scrapeEvent(page, event);
-    if (result) scraped++; else failed++;
-    await randomDelay(SCRAPE_DELAY_MS, SCRAPE_DELAY_MS + 3000);
+
+    // Also check window.__NEXT_DATA__ or any global state
+    const nextDataEl = document.querySelector('#__NEXT_DATA__');
+    if (nextDataEl) {
+      try {
+        const parsed = JSON.parse(nextDataEl.textContent);
+        const str = JSON.stringify(parsed);
+        // Search for 6-digit IDs paired with section names
+        const matches = [...str.matchAll(/"(?:sectionId|id)"\s*:\s*(\d{5,})[^}]{0,100}"(?:name|sectionName|label)"\s*:\s*"([^"]{1,20})"/g)];
+        for (const m of matches) {
+          results.push({ id: m[1], name: m[2], source: 'nextdata' });
+        }
+      } catch(_) {}
+    }
+
+    return results.slice(0, 50);
+  });
+
+  console.log('\n--- Section ID mappings found ---');
+  if (sectionMapping.length === 0) {
+    console.log('NONE FOUND in scripts');
+  } else {
+    sectionMapping.forEach(m => console.log(m.source+':', m.id, '->', m.name));
   }
 
+  // Now intercept network: click a section on the map and capture the request
+  console.log('\n--- Intercepted section requests ---');
+  sectionRequests.forEach(r => console.log(r.slice(0, 200)));
+
+  // Try clicking the first section on the map
+  console.log('\nAttempting to click a map section...');
+  try {
+    // Find SVG elements with sprite-identifier
+    const clicked = await page.evaluate(() => {
+      const els = document.querySelectorAll('[sprite-identifier]');
+      if (els.length > 0) {
+        els[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        return { clicked: true, id: els[0].getAttribute('sprite-identifier'), count: els.length };
+      }
+      return { clicked: false, count: 0 };
+    });
+    console.log('Click result:', JSON.stringify(clicked));
+    await randomDelay(2000, 3000);
+    console.log('Requests after click:', sectionRequests.slice(-5).map(r => r.slice(0, 200)).join('\n'));
+  } catch(e) {
+    console.log('Click failed:', e.message);
+  }
+
+  // Log current URL
+  console.log('\nCurrent URL after interactions:', page.url());
+
   await browser.close();
-  console.log('\nDone — scraped:'+scraped+' skipped:'+skipped+' failed:'+failed);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

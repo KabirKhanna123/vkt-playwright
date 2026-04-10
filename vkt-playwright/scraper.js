@@ -217,10 +217,12 @@ async function scrapeEvent(page, event) {
       console.log('  Scraping '+sectionNumbers.length+' sections...');
       let postedSections = 0;
       for (const secNum of sectionNumbers) {
+        let secPage = null;
         try {
+          secPage = await page.context().newPage();
           const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${secNum}&quantity=0`;
-          await navigateTo(page, secUrl, SECTION_DELAY_MS);
-          const secData = await extractSectionPrices(page, totalListings);
+          await navigateTo(secPage, secUrl, SECTION_DELAY_MS);
+          const secData = await extractSectionPrices(secPage, totalListings);
 
           const secTotal = secData.totalListings;
           if (!secTotal || secTotal === totalListings) continue;
@@ -241,7 +243,8 @@ async function scrapeEvent(page, event) {
             console.log('    Section '+secNum+': '+secTotal+' listings, floor $'+secSummary.floor);
           }
           await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 1500);
-        } catch(e) { console.error('    Section '+secNum+' failed:', e.message); continue; }
+        } catch(e) { console.error('    Section '+secNum+' failed:', e.message); }
+        finally { if (secPage) { try { await secPage.close(); } catch(_) {} } }
       }
       console.log('  Sections posted: '+postedSections+'/'+sectionNumbers.length);
     }

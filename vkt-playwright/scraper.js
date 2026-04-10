@@ -22,7 +22,7 @@ async function dismissModals(page) {
 }
 
 async function main() {
-  console.log('VKT debug: find section ID mapping');
+  console.log('VKT debug: intercept API responses');
 
   const eventId = process.argv[2] || '160425611';
 
@@ -46,13 +46,32 @@ async function main() {
     window.chrome = { runtime: {} };
   });
 
-  // Intercept all XHR/fetch requests to find section API calls
-  const sectionRequests = [];
-  context.on('request', request => {
-    const url = request.url();
-    if (url.includes('sections=') || url.includes('section') && url.includes(eventId)) {
-      sectionRequests.push(url);
-    }
+  const interestingResponses = [];
+
+  // Intercept all responses and capture JSON ones that look relevant
+  context.on('response', async response => {
+    const url = response.url();
+    const status = response.status();
+    if (status !== 200) return;
+
+    // Focus on StubHub/viagogo API calls
+    if (!url.includes('stubhub') && !url.includes('viagogo') && !url.includes('103930817')) return;
+    if (url.includes('.js') || url.includes('.css') || url.includes('.png') || url.includes('.pbf')) return;
+
+    try {
+      const text = await response.text();
+      if (text.length < 50 || text.length > 500000) return;
+      if (!text.startsWith('{') && !text.startsWith('[')) return;
+
+      // Check if it contains section-related data
+      if (text.includes('section') || text.includes('Section') || text.includes('listing')) {
+        interestingResponses.push({
+          url: url.slice(0, 150),
+          size: text.length,
+          sample: text.slice(0, 300)
+        });
+      }
+    } catch(_) {}
   });
 
   const page = await context.newPage();
@@ -61,80 +80,20 @@ async function main() {
 
   const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
   console.log('Loading:', url);
-  await page.goto(url, { waitUntil:'domcontentloaded', timeout:30000 });
-  await randomDelay(5000, 7000);
+  await page.goto(url, { waitUntil:'networkidle', timeout:45000 });
+  await randomDelay(3000, 5000);
   await dismissModals(page);
 
-  // Search all script tags for section ID mappings
-  const sectionMapping = await page.evaluate(() => {
-    const results = [];
-    const scripts = Array.from(document.querySelectorAll('script'));
-    for (const script of scripts) {
-      const content = script.textContent || '';
-      // Look for patterns like "sectionId":194578,"name":"129" or similar
-      if (content.includes('194') && content.includes('section')) {
-        // Try to find JSON with sectionId + name pairs
-        const matches = [...content.matchAll(/"(?:sectionId|id)"\s*:\s*(\d{5,})[^}]*?"(?:name|sectionName|label)"\s*:\s*"([^"]+)"/g)];
-        for (const m of matches) {
-          results.push({ id: m[1], name: m[2], source: 'script' });
-        }
-        // Also try reversed
-        const matches2 = [...content.matchAll(/"(?:name|sectionName|label)"\s*:\s*"([^"]+)"[^}]*?"(?:sectionId|id)"\s*:\s*(\d{5,})/g)];
-        for (const m of matches2) {
-          results.push({ id: m[2], name: m[1], source: 'script-rev' });
-        }
-      }
-    }
-
-    // Also check window.__NEXT_DATA__ or any global state
-    const nextDataEl = document.querySelector('#__NEXT_DATA__');
-    if (nextDataEl) {
-      try {
-        const parsed = JSON.parse(nextDataEl.textContent);
-        const str = JSON.stringify(parsed);
-        // Search for 6-digit IDs paired with section names
-        const matches = [...str.matchAll(/"(?:sectionId|id)"\s*:\s*(\d{5,})[^}]{0,100}"(?:name|sectionName|label)"\s*:\s*"([^"]{1,20})"/g)];
-        for (const m of matches) {
-          results.push({ id: m[1], name: m[2], source: 'nextdata' });
-        }
-      } catch(_) {}
-    }
-
-    return results.slice(0, 50);
-  });
-
-  console.log('\n--- Section ID mappings found ---');
-  if (sectionMapping.length === 0) {
-    console.log('NONE FOUND in scripts');
+  console.log('\n--- Intercepted JSON API responses ---');
+  if (interestingResponses.length === 0) {
+    console.log('NONE FOUND');
   } else {
-    sectionMapping.forEach(m => console.log(m.source+':', m.id, '->', m.name));
-  }
-
-  // Now intercept network: click a section on the map and capture the request
-  console.log('\n--- Intercepted section requests ---');
-  sectionRequests.forEach(r => console.log(r.slice(0, 200)));
-
-  // Try clicking the first section on the map
-  console.log('\nAttempting to click a map section...');
-  try {
-    // Find SVG elements with sprite-identifier
-    const clicked = await page.evaluate(() => {
-      const els = document.querySelectorAll('[sprite-identifier]');
-      if (els.length > 0) {
-        els[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
-        return { clicked: true, id: els[0].getAttribute('sprite-identifier'), count: els.length };
-      }
-      return { clicked: false, count: 0 };
+    interestingResponses.forEach((r, i) => {
+      console.log('\n['+i+'] '+r.url);
+      console.log('Size: '+r.size);
+      console.log('Sample: '+r.sample);
     });
-    console.log('Click result:', JSON.stringify(clicked));
-    await randomDelay(2000, 3000);
-    console.log('Requests after click:', sectionRequests.slice(-5).map(r => r.slice(0, 200)).join('\n'));
-  } catch(e) {
-    console.log('Click failed:', e.message);
   }
-
-  // Log current URL
-  console.log('\nCurrent URL after interactions:', page.url());
 
   await browser.close();
 }

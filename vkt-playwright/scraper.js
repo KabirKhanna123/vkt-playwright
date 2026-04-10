@@ -48,27 +48,21 @@ async function main() {
 
   const interestingResponses = [];
 
-  // Intercept all responses and capture JSON ones that look relevant
   context.on('response', async response => {
     const url = response.url();
     const status = response.status();
     if (status !== 200) return;
-
-    // Focus on StubHub/viagogo API calls
-    if (!url.includes('stubhub') && !url.includes('viagogo') && !url.includes('103930817')) return;
-    if (url.includes('.js') || url.includes('.css') || url.includes('.png') || url.includes('.pbf')) return;
+    if (url.includes('.js') || url.includes('.css') || url.includes('.png') || url.includes('.pbf') || url.includes('.woff')) return;
 
     try {
       const text = await response.text();
-      if (text.length < 50 || text.length > 500000) return;
+      if (text.length < 50 || text.length > 300000) return;
       if (!text.startsWith('{') && !text.startsWith('[')) return;
-
-      // Check if it contains section-related data
-      if (text.includes('section') || text.includes('Section') || text.includes('listing')) {
+      if (text.includes('section') || text.includes('listing')) {
         interestingResponses.push({
-          url: url.slice(0, 150),
+          url: url.slice(0, 200),
           size: text.length,
-          sample: text.slice(0, 300)
+          sample: text.slice(0, 400)
         });
       }
     } catch(_) {}
@@ -80,20 +74,19 @@ async function main() {
 
   const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
   console.log('Loading:', url);
-  await page.goto(url, { waitUntil:'networkidle', timeout:45000 });
-  await randomDelay(3000, 5000);
+  await page.goto(url, { waitUntil:'domcontentloaded', timeout:30000 });
+
+  // Wait for JS to fire API calls
+  console.log('Waiting for API calls...');
+  await sleep(10000);
   await dismissModals(page);
 
-  console.log('\n--- Intercepted JSON API responses ---');
-  if (interestingResponses.length === 0) {
-    console.log('NONE FOUND');
-  } else {
-    interestingResponses.forEach((r, i) => {
-      console.log('\n['+i+'] '+r.url);
-      console.log('Size: '+r.size);
-      console.log('Sample: '+r.sample);
-    });
-  }
+  console.log('\n--- Intercepted JSON API responses ('+interestingResponses.length+') ---');
+  interestingResponses.forEach((r, i) => {
+    console.log('\n['+i+'] '+r.url);
+    console.log('Size: '+r.size);
+    console.log('Sample: '+r.sample);
+  });
 
   await browser.close();
 }

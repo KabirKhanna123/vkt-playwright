@@ -10,9 +10,8 @@ const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
 
 const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '8000', 10);
 const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '4000', 10);
+// RECENT_HOURS is ignored now because we force scraping
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
-// EVENT_LIMIT is no longer relevant for single-event mode but kept for compatibility
-const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
@@ -50,51 +49,49 @@ function summarizePrices(prices) {
   };
 }
 
-// *** Only fetch event 160425611 ***
+// Only fetch event 160425611
 async function getEvents() {
+  console.log('[getEvents] Fetching event 160425611 from Supabase...');
   const { data, error } = await supabase
     .from('events')
     .select('id,name,date,venue,platform,is_major')
-    .eq('id', '160425611')   // only this event
+    .eq('id', '160425611')
     .limit(1);
 
   if (error) {
-    console.error('Failed to fetch events:', error.message);
+    console.error('[getEvents] Failed to fetch events:', error.message);
     return [];
   }
+  console.log('[getEvents] Result:', data);
   return data || [];
 }
 
+// FORCED: always return false so we never skip for "recently scraped"
 async function scrapedRecently(eventId, hours=RECENT_HOURS) {
-  const since = new Date(Date.now() - hours*3600000).toISOString();
-  const { data, error } = await supabase
-    .from('volume_snapshots')
-    .select('id')
-    .eq('event_id',eventId)
-    .is('section',null)
-    .gte('scraped_at',since)
-    .limit(1);
-  if (error) {
-    console.error('scrapedRecently error:', error.message);
-    return false;
-  }
-  return !!(data && data.length > 0);
+  console.log(`[scrapedRecently] Forcing scrape for event ${eventId} (ignoring last ${hours}h)`);
+  return false;
 }
 
 async function postSnapshot(payload) {
   try {
-    const r = await fetch(VKT_API+'/api/snapshot', {
+    console.log('[postSnapshot] Sending payload:', JSON.stringify(payload, null, 2));
+
+    const r = await fetch(VKT_API + '/api/snapshot', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify(payload)
     });
+
+    const text = await r.text();
     if (!r.ok) {
-      console.error('  Snapshot failed:', r.status, await r.text());
+      console.error('[postSnapshot] Snapshot failed:', r.status, text);
       return false;
     }
+
+    console.log('[postSnapshot] Snapshot success. Status:', r.status, 'Response:', text);
     return true;
   } catch(e) {
-    console.error('  Snapshot error:', e.message);
+    console.error('[postSnapshot] Snapshot error:', e.message);
     return false;
   }
 }
@@ -110,6 +107,7 @@ async function dismissModals(page) {
     try {
       const el = page.locator(sel).first();
       if (await el.isVisible({timeout:600})) {
+        console.log(`[dismissModals] Clicking modal button: ${sel}`);
         await el.click({timeout:800});
         await page.waitForTimeout(400);
       }
@@ -118,14 +116,16 @@ async function dismissModals(page) {
 }
 
 async function navigateTo(page, url, waitMs=4000) {
+  console.log('[navigateTo] Navigating to:', url);
   await page.goto(url, { waitUntil:'domcontentloaded', timeout:45000 });
   await randomDelay(waitMs, waitMs + 2000);
   await dismissModals(page);
 
   const title = (await page.title()) || '';
   const lower = title.toLowerCase();
+  console.log('[navigateTo] Page title:', title);
   if (!title || lower.includes('just a moment') || lower.includes('access denied')) {
-    console.warn('  Challenge page detected, retrying...');
+    console.warn('[navigateTo] Challenge page detected, retrying...');
     await randomDelay(5000, 8000);
     await page.reload({ waitUntil:'domcontentloaded', timeout:45000 });
     await randomDelay(waitMs, waitMs + 2000);
@@ -135,6 +135,7 @@ async function navigateTo(page, url, waitMs=4000) {
 
 // EVENT-LEVEL extraction
 async function extractPageData(page) {
+  console.log('[extractPageData] Extracting event-level data...');
   return await page.evaluate(({minPrice, maxPrice, ticketRowSelector}) => {
     let name = null, date = null, venue = null;
 
@@ -203,6 +204,7 @@ async function extractPageData(page) {
 
 // SECTION-LEVEL extraction (URL already filtered by ?sections=XXX)
 async function extractSectionPrices(page) {
+  console.log('[extractSectionPrices] Extracting section-level data...');
   return await page.evaluate(({minPrice, maxPrice, ticketRowSelector}) => {
     try {
       if (!document || !document.body) {
@@ -241,14 +243,19 @@ async function scrapeEvent(page, event) {
   const originalName = event.name || 'Event '+eventId;
   const isMajor = event.is_major === true;
 
+  console.log(`[scrapeEvent] Starting event ${eventId} (is_major=${isMajor})`);
+
   try {
     const url = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
     await navigateTo(page, url, SCRAPE_DELAY_MS);
 
-    // Best-effort wait for ticket rows
-    await page.waitForSelector(TICKET_ROW_SELECTOR, { timeout:15000 }).catch(() => {});
+    console.log('[scrapeEvent] Waiting for ticket rows selector:', TICKET_ROW_SELECTOR);
+    await page.waitForSelector(TICKET_ROW_SELECTOR, { timeout:15000 }).catch(() => {
+      console.warn('[scrapeEvent] Ticket row selector not found within timeout');
+    });
 
     const data = await extractPageData(page);
+    console.log('[scrapeEvent] Raw extractPageData result:', JSON.stringify(data, null, 2));
 
     let name = data.name || originalName;
     if (name && name.toLowerCase().includes('tickets')) name = originalName;
@@ -258,7 +265,7 @@ async function scrapeEvent(page, event) {
 
     const summary = summarizePrices(prices);
     if (!summary.floor) {
-      console.log('  No pricing for '+name);
+      console.log('[scrapeEvent] No valid pricing found for', name);
       return;
     }
 
@@ -287,21 +294,28 @@ async function scrapeEvent(page, event) {
     if (venue && venue !== event.venue) updates.venue = venue;
     if (date && date !== event.date) updates.date = date;
     if (Object.keys(updates).length) {
+      console.log('[scrapeEvent] Updating events table with:', updates);
       await supabase.from('events').update(updates).eq('id', eventId);
     }
 
     // Section scraping for major events
     if (isMajor && sectionNumbers.length > 0) {
-      console.log(`  Scraping ${sectionNumbers.length} sections...`);
+      console.log(`[scrapeEvent] Scraping ${sectionNumbers.length} sections:`, sectionNumbers);
 
       for (const section of sectionNumbers) {
         try {
           const sectionUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0&sections=${encodeURIComponent(section)}`;
+          console.log(`[scrapeEvent] Navigating to section ${section}: ${sectionUrl}`);
           await navigateTo(page, sectionUrl, SECTION_DELAY_MS);
 
-          await page.waitForSelector(TICKET_ROW_SELECTOR, { timeout:15000 }).catch(() => {});
+          console.log('[scrapeEvent] Waiting for ticket rows on section page...');
+          await page.waitForSelector(TICKET_ROW_SELECTOR, { timeout:15000 }).catch(() => {
+            console.warn(`[scrapeEvent] Section ${section}: ticket row selector not found within timeout`);
+          });
 
           const sectionResult = await extractSectionPrices(page);
+          console.log(`[scrapeEvent] Section ${section} raw result:`, JSON.stringify(sectionResult, null, 2));
+
           if (sectionResult.error) {
             console.warn(`    Section ${section}: extractSectionPrices error: ${sectionResult.error}`);
           }
@@ -339,9 +353,11 @@ async function scrapeEvent(page, event) {
           console.error(`    Section ${section} error:`, e.message);
         }
       }
+    } else {
+      console.log(`[scrapeEvent] Skipping section-level scraping (is_major=${isMajor}, sections found=${sectionNumbers.length})`);
     }
   } catch(e) {
-    console.error(`  Error scraping event ${eventId}:`, e.message);
+    console.error(`[scrapeEvent] Error scraping event ${eventId}:`, e);
   }
 }
 
@@ -349,10 +365,10 @@ async function main() {
   console.log('VKT Playwright scraper starting...');
 
   const events = await getEvents();
-  console.log('Events to process:', events.length);
+  console.log('[main] Events to process:', events.length);
 
   if (!events.length) {
-    console.log('No events found for id 160425611');
+    console.log('[main] No events found for id 160425611');
     return;
   }
 
@@ -366,13 +382,11 @@ async function main() {
 
   for (const event of events) {
     const eventId = event.id;
-    console.log(`Scraping: ${event.name || eventId} (${eventId})`);
+    console.log(`[main] Scraping: ${event.name || eventId} (${eventId})`);
 
+    // Forced: do not skip for "recently scraped"
     const recently = await scrapedRecently(eventId);
-    if (recently) {
-      console.log('  Skipping (recently scraped)');
-      continue;
-    }
+    console.log(`[main] scrapedRecently(${eventId}) returned:`, recently);
 
     await scrapeEvent(page, event);
     await randomDelay(SCRAPE_DELAY_MS, SCRAPE_DELAY_MS + 3000);

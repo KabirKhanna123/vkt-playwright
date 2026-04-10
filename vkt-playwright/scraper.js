@@ -9,10 +9,10 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6Ik
 const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
 
 const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '8000', 10);
-const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '3000', 10);
+const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '4000', 10);
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
 const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
-const MIN_PRICE = 10; // ignore prices below $10 to filter UI noise
+const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -78,19 +78,26 @@ async function dismissModals(page) {
 }
 
 async function navigateTo(page, url, waitMs=4000) {
-  await page.goto(url, { waitUntil:'domcontentloaded', timeout:30000 });
+  await page.goto(url, { waitUntil:'domcontentloaded', timeout:45000 });
   await randomDelay(waitMs, waitMs + 2000);
   await dismissModals(page);
-  const title = await page.title();
-  if (!title || title.toLowerCase().includes('just a moment')) {
+
+  const title = (await page.title()) || '';
+  const lower = title.toLowerCase();
+  if (!title || lower.includes('just a moment') || lower.includes('access denied')) {
+    console.warn('  Challenge page detected, retrying...');
     await randomDelay(5000, 8000);
+    await page.reload({ waitUntil:'domcontentloaded', timeout:45000 });
+    await randomDelay(waitMs, waitMs + 2000);
+    await dismissModals(page);
   }
 }
 
 async function extractPageData(page) {
   return await page.evaluate(({minPrice, maxPrice}) => {
-    // Event metadata from JSON-LD
     let name = null, date = null, venue = null;
+
+    // JSON-LD metadata
     const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
     for (const script of scripts) {
       try {
@@ -112,28 +119,29 @@ async function extractPageData(page) {
       if (name && date && venue) break;
     }
 
-    // Listing count — look for the most prominent number followed by "listings"
     const bodyText = document.body?.innerText || '';
 
-    // Primary: look for standalone "X listings" text (the main counter)
+    // Listing count
     const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
       .map(m => parseInt(m[1].replace(/,/g,''), 10))
       .filter(v => Number.isFinite(v) && v > 0);
     const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
 
-    // Prices — walk visible text nodes, filter to realistic ticket price range
+    // Prices
     const prices = [];
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
-      if (!node.parentElement) continue;
-      if (node.parentElement.closest('script,style,noscript,svg')) continue;
-      const style = window.getComputedStyle(node.parentElement);
-      if (style.display === 'none' || style.visibility === 'hidden') continue;
-      for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-        const value = parseFloat(match[1].replace(/,/g,''));
-        if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
-      }
+      try {
+        if (!node.parentElement) continue;
+        if (node.parentElement.closest('script,style,noscript,svg')) continue;
+        const style = window.getComputedStyle(node.parentElement);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+          const value = parseFloat(match[1].replace(/,/g,''));
+          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
+        }
+      } catch(_) { continue; }
     }
     prices.sort((a,b) => a-b);
 
@@ -151,30 +159,47 @@ async function extractPageData(page) {
   }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
 }
 
-async function extractSectionPrices(page, eventTotalListings) {
-  return await page.evaluate(({minPrice, maxPrice, eventTotal}) => {
-    const bodyText = document.body?.innerText || '';
-    const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
-      .map(m => parseInt(m[1].replace(/,/g,''), 10))
-      .filter(v => Number.isFinite(v) && v > 0);
-    const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
+async function extractSectionPrices(page) {
+  return await page.evaluate(({minPrice, maxPrice}) => {
+    try {
+      if (!document || !document.body) return { totalListings:0, prices:[], error:'no-body' };
 
-    const prices = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      if (!node.parentElement) continue;
-      if (node.parentElement.closest('script,style,noscript,svg')) continue;
-      const style = window.getComputedStyle(node.parentElement);
-      if (style.display === 'none' || style.visibility === 'hidden') continue;
-      for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-        const value = parseFloat(match[1].replace(/,/g,''));
-        if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
+      const bodyText = document.body.innerText || '';
+
+      if (!/listings?/i.test(bodyText) && !/\$\s*[\d,]+/.test(bodyText)) {
+        return { totalListings:0, prices:[], error:'no-listings-text' };
       }
+
+      const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
+        .map(m => parseInt(m[1].replace(/,/g,''), 10))
+        .filter(v => Number.isFinite(v) && v > 0);
+      const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
+
+      const prices = [];
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        try {
+          if (!node.parentElement) continue;
+          if (node.parentElement.closest('script,style,noscript,svg')) continue;
+          let style;
+          try { style = window.getComputedStyle(node.parentElement); } catch { continue; }
+          if (!style || style.display === 'none' || style.visibility === 'hidden') continue;
+          const text = node.textContent || '';
+          if (!text.includes('$')) continue;
+          for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+            const value = parseFloat(match[1].replace(/,/g,''));
+            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
+          }
+        } catch { continue; }
+      }
+
+      prices.sort((a,b) => a-b);
+      return { totalListings, prices, error:null };
+    } catch(e) {
+      return { totalListings:0, prices:[], error: e?.message || 'unknown' };
     }
-    prices.sort((a,b) => a-b);
-    return { totalListings, prices };
-  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE, eventTotal: eventTotalListings});
+  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
 }
 
 async function scrapeEvent(page, event) {
@@ -216,19 +241,42 @@ async function scrapeEvent(page, event) {
     if (isMajor && sectionNumbers.length > 0) {
       console.log('  Scraping '+sectionNumbers.length+' sections...');
       let postedSections = 0;
+
       for (const secNum of sectionNumbers) {
         let secPage = null;
         try {
           secPage = await page.context().newPage();
+
+          // Forward console logs from section page
+          secPage.on('console', msg => { if (msg.type() === 'error') console.log('  PAGE ERR:', msg.text()); });
+
           const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${secNum}&quantity=0`;
           await navigateTo(secPage, secUrl, SECTION_DELAY_MS);
-          const secData = await extractSectionPrices(secPage, totalListings);
 
-          const secTotal = secData.totalListings;
-          if (!secTotal || secTotal === totalListings) continue;
+          // Wait for page to settle
+          await Promise.race([
+            secPage.waitForFunction(() => /listings?/i.test(document.body?.innerText||''), {timeout:8000}).catch(()=>{}),
+            sleep(8000)
+          ]);
 
-          const secSummary = summarizePrices(secData.prices);
-          if (!secSummary.floor) continue;
+          const secResult = await extractSectionPrices(secPage);
+
+          if (secResult.error) {
+            console.log('    Section '+secNum+': error — '+secResult.error);
+            continue;
+          }
+
+          const { totalListings: secTotal, prices: secPrices } = secResult;
+          const secSummary = summarizePrices(secPrices);
+
+          if (!secTotal && !secSummary.floor) {
+            console.log('    Section '+secNum+': no data');
+            continue;
+          }
+          if (!secSummary.floor) {
+            console.log('    Section '+secNum+': '+secTotal+' listings, no valid prices');
+            continue;
+          }
 
           const ok = await postSnapshot({
             eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
@@ -242,9 +290,13 @@ async function scrapeEvent(page, event) {
             postedSections++;
             console.log('    Section '+secNum+': '+secTotal+' listings, floor $'+secSummary.floor);
           }
-          await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 1500);
-        } catch(e) { console.error('    Section '+secNum+' failed:', e.message); }
-        finally { if (secPage) { try { await secPage.close(); } catch(_) {} } }
+
+          await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 2000);
+        } catch(e) {
+          console.error('    Section '+secNum+' failed:', e.message);
+        } finally {
+          if (secPage) { try { await secPage.close(); } catch(_) {} }
+        }
       }
       console.log('  Sections posted: '+postedSections+'/'+sectionNumbers.length);
     }

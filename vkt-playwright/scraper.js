@@ -22,8 +22,8 @@ const RECENT_HOURS     = parseInt(process.env.RECENT_HOURS     || '20',   10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
-// StubHub ticket row selector (adjust if needed)
-const TICKET_ROW_SELECTOR = 'div[role="button"][data-index][data-listing-id]';
+// We will discover the right selector via debug
+let TICKET_ROW_SELECTOR = null;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -161,7 +161,48 @@ async function dismissModals(page) {
   }
 }
 
-// ---------- Extraction using StubHub ticket rows ----------
+// ---------- DEBUG: inspect StubHub structure ----------
+
+async function debugStubhubStructure(page) {
+  console.log('  [DEBUG] Inspecting StubHub HTML structure...');
+
+  const htmlSnippet = await page.evaluate(() => {
+    const html = document.documentElement.outerHTML || '';
+    const idx = html.indexOf('$');
+    if (idx === -1) return html.slice(0, 2000);
+    const start = Math.max(0, idx - 1000);
+    const end   = Math.min(html.length, idx + 1000);
+    return html.slice(start, end);
+  });
+
+  console.log('  [DEBUG] HTML around first "$":\n', htmlSnippet.slice(0, 2000));
+
+  const selectorStats = await page.evaluate(() => {
+    const candidates = [
+      'div[role="button"][data-index][data-listing-id]',
+      'div[data-test="ticket-row"]',
+      'li[data-test="ticket-row"]',
+      'div[data-qa="ticket-row"]',
+      'div[class*="TicketRow"]',
+      'div[class*="ticket-row"]',
+      'div[class*="ListingRow"]',
+      'div[class*="listing-row"]'
+    ];
+    const stats = {};
+    for (const sel of candidates) {
+      try {
+        stats[sel] = document.querySelectorAll(sel).length;
+      } catch {
+        stats[sel] = 'error';
+      }
+    }
+    return stats;
+  });
+
+  console.log('  [DEBUG] Candidate selector counts:', selectorStats);
+}
+
+// ---------- Extraction using ticket rows (if selector known) or fallback ----------
 
 async function extractPageData(page) {
   return await page.evaluate(({minPrice, maxPrice, ticketRowSelector}) => {
@@ -189,31 +230,55 @@ async function extractPageData(page) {
       if (name && date && venue) break;
     }
 
-    // Ticket rows
-    const rows = ticketRowSelector
-      ? Array.from(document.querySelectorAll(ticketRowSelector))
-      : [];
-    const totalListings = rows.length;
-
     const prices = [];
-    for (const row of rows) {
-      try {
-        const text = row.innerText || '';
-        if (!text.includes('$')) continue;
-        for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-          const value = parseFloat(match[1].replace(/,/g,''));
-          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) {
-            prices.push(value);
+    let totalListings = 0;
+
+    if (ticketRowSelector) {
+      // Use discovered ticket row selector
+      const rows = Array.from(document.querySelectorAll(ticketRowSelector));
+      totalListings = rows.length;
+      for (const row of rows) {
+        try {
+          const text = row.innerText || '';
+          if (!text.includes('$')) continue;
+          for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+            const value = parseFloat(match[1].replace(/,/g,''));
+            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) {
+              prices.push(value);
+            }
           }
-        }
-      } catch(_) { continue; }
+        } catch(_) { continue; }
+      }
+    } else {
+      // Fallback: scan all visible text
+      const bodyText = document.body?.innerText || '';
+      const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
+        .map(m => parseInt(m[1].replace(/,/g,''), 10))
+        .filter(v => Number.isFinite(v) && v > 0);
+      totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
+
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        try {
+          if (!node.parentElement) continue;
+          if (node.parentElement.closest('script,style,noscript,svg')) continue;
+          const style = window.getComputedStyle(node.parentElement);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+            const value = parseFloat(match[1].replace(/,/g,''));
+            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
+          }
+        } catch(_) { continue; }
+      }
     }
+
     prices.sort((a,b) => a-b);
 
     // Section numbers (heuristic)
-    const bodyText = document.body?.innerText || '';
+    const bodyText2 = document.body?.innerText || '';
     const sectionNumbers = new Set();
-    const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    const lines = bodyText2.split('\n').map(l => l.trim()).filter(l => l.length > 0);
     for (const line of lines) {
       if (/^\d{2,3}[A-Z]?$/.test(line)) {
         const n = parseInt(line, 10);
@@ -230,23 +295,42 @@ async function extractSectionPrices(page) {
     try {
       if (!document || !document.body) return { totalListings:0, prices:[], error:'no-body' };
 
-      const rows = ticketRowSelector
-        ? Array.from(document.querySelectorAll(ticketRowSelector))
-        : [];
-      const totalListings = rows.length;
-
       const prices = [];
-      for (const row of rows) {
-        try {
-          const text = row.innerText || '';
-          if (!text.includes('$')) continue;
-          for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
-            const value = parseFloat(match[1].replace(/,/g,''));
-            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) {
-              prices.push(value);
+      let totalListings = 0;
+
+      if (ticketRowSelector) {
+        const rows = Array.from(document.querySelectorAll(ticketRowSelector));
+        totalListings = rows.length;
+        for (const row of rows) {
+          try {
+            const text = row.innerText || '';
+            if (!text.includes('$')) continue;
+            for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+              const value = parseFloat(match[1].replace(/,/g,''));
+              if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) {
+                prices.push(value);
+              }
             }
-          }
-        } catch { continue; }
+          } catch { continue; }
+        }
+      } else {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+          try {
+            if (!node.parentElement) continue;
+            if (node.parentElement.closest('script,style,noscript,svg')) continue;
+            let style;
+            try { style = window.getComputedStyle(node.parentElement); } catch { continue; }
+            if (!style || style.display === 'none' || style.visibility === 'hidden') continue;
+            const text = node.textContent || '';
+            if (!text.includes('$')) continue;
+            for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+              const value = parseFloat(match[1].replace(/,/g,''));
+              if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
+            }
+          } catch { continue; }
+        }
       }
 
       prices.sort((a,b) => a-b);
@@ -286,6 +370,8 @@ async function scrapeEvent(page, event) {
     const summary = summarizePrices(prices);
     if (!summary.floor) {
       console.log('  No valid pricing found for', name);
+      // DEBUG: inspect HTML and candidate selectors
+      await debugStubhubStructure(page);
       return;
     }
 

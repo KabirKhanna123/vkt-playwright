@@ -11,6 +11,7 @@ const VKT_API = process.env.VKT_API || 'https://vkt-volume-api.vercel.app';
 const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '8000', 10);
 const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '4000', 10);
 const RECENT_HOURS = parseInt(process.env.RECENT_HOURS || '20', 10);
+// EVENT_LIMIT is no longer relevant for single-event mode but kept for compatibility
 const EVENT_LIMIT = parseInt(process.env.EVENT_LIMIT || '200', 10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
@@ -49,13 +50,14 @@ function summarizePrices(prices) {
   };
 }
 
+// *** Only fetch event 160425611 ***
 async function getEvents() {
   const { data, error } = await supabase
     .from('events')
     .select('id,name,date,venue,platform,is_major')
-    .not('id','like','tm_%')
-    .order('date', { ascending: true })
-    .limit(EVENT_LIMIT);
+    .eq('id', '160425611')   // only this event
+    .limit(1);
+
   if (error) {
     console.error('Failed to fetch events:', error.message);
     return [];
@@ -348,6 +350,11 @@ async function main() {
 
   const events = await getEvents();
   console.log('Events to process:', events.length);
+
+  if (!events.length) {
+    console.log('No events found for id 160425611');
+    return;
+  }
 
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();

@@ -1,25 +1,29 @@
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { createClient } = require('@supabase/supabase-js');
-const fetch = require('node-fetch'); // make sure: npm install node-fetch@2
+const fetch = require('node-fetch'); // npm install node-fetch@2
 
 chromium.use(StealthPlugin());
 
+// Bright Data Web Unlocker
 const BRIGHTDATA_API_TOKEN = process.env.BRIGHTDATA_API_TOKEN || 'ac7d557e-67eb-4e04-90ef-56b1db829ab7';
 const WEB_UNLOCKER_ZONE    = process.env.WEB_UNLOCKER_ZONE    || 'web_unlocker1';
 
+// Supabase & Vercel API
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
 const VKT_API      = process.env.VKT_API      || 'https://vkt-volume-api.vercel.app';
 
+// Timings & price filters
 const SCRAPE_DELAY_MS  = parseInt(process.env.SCRAPE_DELAY_MS  || '5000', 10);
 const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '3000', 10);
 const RECENT_HOURS     = parseInt(process.env.RECENT_HOURS     || '20',   10);
-const EVENT_LIMIT      = parseInt(process.env.EVENT_LIMIT      || '200',  10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ---------- Helpers ----------
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function randomDelay(min, max) { return sleep(min + Math.random() * (max - min)); }
@@ -50,13 +54,16 @@ function summarizePrices(prices) {
   };
 }
 
+// ---------- Supabase: ONLY event 160425611 ----------
+
 async function getEvents() {
+  console.log('[getEvents] TEST MODE: only event 160425611');
   const { data, error } = await supabase
     .from('events')
     .select('id,name,date,venue,platform,is_major')
-    .not('id', 'like', 'tm_%')
-    .order('date', { ascending: true })
-    .limit(EVENT_LIMIT);
+    .eq('id', '160425611')   // only this event
+    .limit(1);
+
   if (error) {
     console.error('Failed to fetch events:', error.message);
     return [];
@@ -94,6 +101,8 @@ async function postSnapshot(payload) {
   }
 }
 
+// ---------- Web Unlocker ----------
+
 async function fetchWithWebUnlocker(targetUrl) {
   console.log('  Fetching via Web Unlocker:', targetUrl);
 
@@ -129,6 +138,8 @@ async function fetchWithWebUnlocker(targetUrl) {
   console.log('  Raw HTML length:', text.length);
   return text;
 }
+
+// ---------- Playwright helpers ----------
 
 async function dismissModals(page) {
   for (const sel of [
@@ -259,6 +270,8 @@ async function extractSectionPrices(page) {
   }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
 }
 
+// ---------- Main per‑event logic ----------
+
 async function scrapeEvent(page, event) {
   const eventId = event.id;
   const originalName = event.name || 'Event ' + eventId;
@@ -315,6 +328,7 @@ async function scrapeEvent(page, event) {
       await supabase.from('events').update(updates).eq('id', eventId);
     }
 
+    // Section‑level scraping only if is_major and sections found
     if (isMajor && sectionNumbers.length > 0) {
       console.log(`  Scraping ${sectionNumbers.length} sections:`, sectionNumbers);
 
@@ -375,14 +389,16 @@ async function scrapeEvent(page, event) {
   }
 }
 
+// ---------- Entrypoint ----------
+
 async function main() {
-  console.log('VKT Playwright scraper starting (with Web Unlocker)...');
+  console.log('VKT Playwright scraper starting (with Web Unlocker, TEST event 160425611)...');
 
   const events = await getEvents();
   console.log('Events to process:', events.length);
 
   if (!events.length) {
-    console.log('No events found');
+    console.log('No events found (check Supabase row for id 160425611)');
     return;
   }
 
@@ -399,10 +415,7 @@ async function main() {
     console.log(`\n=== Scraping: ${event.name || eventId} (${eventId}) ===`);
 
     const recently = await scrapedRecently(eventId);
-    if (recently) {
-      console.log('  Skipping, scraped recently');
-      continue;
-    }
+    console.log('  scrapedRecently:', recently);
 
     await scrapeEvent(page, event);
     await randomDelay(SCRAPE_DELAY_MS, SCRAPE_DELAY_MS + 3000);

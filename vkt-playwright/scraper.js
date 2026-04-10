@@ -1,8 +1,5 @@
-const { chromium } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
-
-chromium.use(StealthPlugin());
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -15,10 +12,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function randomDelay(min, max) {
-  return sleep(min + Math.random() * (max - min));
 }
 
 function normalizeText(value) {
@@ -79,9 +72,9 @@ async function dismissModals(page) {
   for (const sel of selectors) {
     try {
       const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 800 })) {
+      if (await el.isVisible({ timeout: 700 })) {
         await el.click({ timeout: 1000 });
-        await page.waitForTimeout(500);
+        await page.waitForTimeout(400);
       }
     } catch (_) {}
   }
@@ -194,7 +187,6 @@ async function getVenueMeta(page) {
     return {
       canonical: getMeta('link[rel="canonical"]', 'href'),
       bodyText: text,
-      title: document.title || '',
     };
   });
 
@@ -247,16 +239,13 @@ async function saveEventMapping({
   if (error) {
     console.error('Supabase event upsert error:', error.message);
   } else {
-    console.log('Saved event to events table:', payload);
+    console.log('Saved event:', payload);
   }
 }
 
 async function saveVenueSections(rows, venueId, venueName) {
   if (!Array.isArray(rows) || rows.length === 0) return;
-  if (!venueId) {
-    console.log('No venue_id available, skipping venue_sections save');
-    return;
-  }
+  if (!venueId) return;
 
   const seen = new Set();
 
@@ -264,7 +253,6 @@ async function saveVenueSections(rows, venueId, venueName) {
     .map((r) => {
       const zoneId = r.sectionsParam ? String(r.sectionsParam) : null;
       const sectionName = normalizeText(r.visibleSection);
-
       if (!zoneId) return null;
 
       const key = `${venueId}__${zoneId}`;
@@ -280,16 +268,11 @@ async function saveVenueSections(rows, venueId, venueName) {
     })
     .filter(Boolean);
 
-  if (cleaned.length === 0) {
-    console.log('No venue sections to save');
-    return;
-  }
+  if (cleaned.length === 0) return;
 
   const { error } = await supabase
     .from('venue_sections')
-    .upsert(cleaned, {
-      onConflict: 'venue_id,zone_id',
-    });
+    .upsert(cleaned, { onConflict: 'venue_id,zone_id' });
 
   if (error) {
     console.error('Venue sections upsert error:', error.message);
@@ -298,18 +281,30 @@ async function saveVenueSections(rows, venueId, venueName) {
   }
 }
 
-async function scrollSeatMap(page) {
-  for (let i = 0; i < 4; i++) {
-    await page.mouse.wheel(0, 600);
-    await page.waitForTimeout(500);
+async function waitForSeatMap(page) {
+  const selectors = [
+    '[sprite-identifier]',
+    'svg [sprite-identifier]',
+    'svg',
+  ];
+
+  for (const sel of selectors) {
+    try {
+      await page.locator(sel).first().waitFor({ timeout: 5000 });
+      return true;
+    } catch (_) {}
   }
 
-  try {
-    await page
-      .locator('[sprite-identifier]')
-      .first()
-      .scrollIntoViewIfNeeded({ timeout: 3000 });
-  } catch (_) {}
+  return false;
+}
+
+async function scrollSeatMap(page) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      await page.mouse.wheel(0, 400);
+      await page.waitForTimeout(400);
+    } catch (_) {}
+  }
 }
 
 async function extractSpriteInfo(page) {
@@ -367,15 +362,31 @@ async function extractSelectedSectionDetails(page) {
   });
 }
 
+async function safeClick(page, x, y) {
+  try {
+    await page.mouse.click(x, y, { delay: 50 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function clickSpriteAndRead(page, sprite) {
   try {
-    await page.mouse.click(sprite.x, sprite.y);
-    await page.waitForTimeout(1800);
+    const clicked = await safeClick(page, sprite.x, sprite.y);
+    if (!clicked) {
+      return { spriteId: sprite.id, error: 'Mouse click failed' };
+    }
+
+    await page.waitForTimeout(1400);
+
+    if (page.isClosed()) {
+      return { spriteId: sprite.id, error: 'Page closed after click' };
+    }
 
     const currentUrl = page.url();
     const parsed = new URL(currentUrl);
     const sectionsParam = parsed.searchParams.get('sections');
-
     const details = await extractSelectedSectionDetails(page);
 
     return {
@@ -407,11 +418,9 @@ async function main() {
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
       '--disable-dev-shm-usage',
-      '--no-first-run',
-      '--no-zygote',
       '--disable-gpu',
+      '--no-zygote',
       '--window-size=1280,900',
     ],
   });
@@ -427,47 +436,30 @@ async function main() {
     },
   });
 
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
-    });
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => [1, 2, 3, 4, 5],
-    });
-    Object.defineProperty(navigator, 'languages', {
-      get: () => ['en-US', 'en'],
-    });
-    window.chrome = { runtime: {} };
-  });
-
   const page = await context.newPage();
 
-  const capturedUrls = [];
-  context.on('request', (req) => {
-    const url = req.url();
-    if (url.includes(String(eventId)) && url.includes('section')) {
-      capturedUrls.push(url);
-    }
+  page.on('crash', () => {
+    console.error('Playwright page crashed');
+  });
+
+  page.on('pageerror', (err) => {
+    console.error('Page error:', err.message);
+  });
+
+  browser.on('disconnected', () => {
+    console.error('Browser disconnected');
   });
 
   try {
-    try {
-      await page.goto('https://www.google.com', {
-        waitUntil: 'domcontentloaded',
-        timeout: 10000,
-      });
-      await randomDelay(1500, 2500);
-    } catch (_) {}
-
     const url = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
     console.log('Loading:', url);
 
     await page.goto(url, {
       waitUntil: 'domcontentloaded',
-      timeout: 30000,
+      timeout: 45000,
     });
 
-    await randomDelay(6000, 8000);
+    await page.waitForTimeout(5000);
     await dismissModals(page);
 
     const eventMeta = await extractEventMeta(page);
@@ -476,13 +468,12 @@ async function main() {
     const venueName = normalizeText(eventMeta.venue || venueMeta.venueName);
     const venueId = buildVenueId(venueName);
 
-    console.log('\n--- Event Meta ---');
     console.log(
       JSON.stringify(
         {
-          ...eventMeta,
-          derivedVenueId: venueId,
-          derivedVenueName: venueName,
+          eventMeta,
+          venueName,
+          venueId,
         },
         null,
         2
@@ -497,50 +488,53 @@ async function main() {
       venueId,
     });
 
+    const seatMapReady = await waitForSeatMap(page);
+    if (!seatMapReady) {
+      console.log('Seat map not found; event was still saved');
+      return;
+    }
+
     await scrollSeatMap(page);
 
     const spriteInfo = await extractSpriteInfo(page);
-
-    console.log('\nVisible sprites found:', spriteInfo.length);
-    console.log(JSON.stringify(spriteInfo.slice(0, 5), null, 2));
+    console.log(`Visible sprites found: ${spriteInfo.length}`);
 
     const sectionMap = [];
 
     for (const sprite of spriteInfo
       .filter((s) => s.visible && s.x > 0 && s.y > 0)
-      .slice(0, 20)) {
-      console.log(`\nClicking sprite ${sprite.id} at ${sprite.x}, ${sprite.y}`);
+      .slice(0, 10)) {
+      if (page.isClosed()) {
+        console.log('Page closed, stopping section scraping');
+        break;
+      }
 
+      console.log(`Clicking sprite ${sprite.id} at ${sprite.x}, ${sprite.y}`);
       const result = await clickSpriteAndRead(page, sprite);
       sectionMap.push(result);
 
       if (result.error) {
         console.log('Click failed:', result.error);
-        continue;
+      } else {
+        console.log('sections param:', result.sectionsParam);
+        console.log('visible section:', result.visibleSection);
       }
 
-      console.log('Clicked URL:', result.clickedUrl);
-      console.log('sections param:', result.sectionsParam);
-      console.log('visible section:', result.visibleSection);
-      console.log('visible row:', result.visibleRow);
-      console.log('visible zone:', result.visibleZone);
-
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(800);
     }
 
-    console.log('\n--- Section Map ---');
     console.log(JSON.stringify(sectionMap, null, 2));
-
-    console.log('\n--- Captured Section URLs ---');
-    capturedUrls.forEach((u) => console.log(u.slice(0, 250)));
-
     await saveVenueSections(sectionMap, venueId, venueName);
   } finally {
-    await browser.close();
+    if (!page.isClosed()) {
+      await page.close().catch(() => {});
+    }
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
   }
 }
 
 main().catch((error) => {
-  console.error(error);
+  console.error('Fatal error:', error);
   process.exit(1);
 });

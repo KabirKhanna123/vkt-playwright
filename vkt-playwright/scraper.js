@@ -46,6 +46,47 @@ function summarizePrices(prices) {
   };
 }
 
+// Build StubHub SEO URL slug from event name, venue, date
+// e.g. "new-england-patriots-foxborough-tickets-3-3-2027/event/160425611"
+function buildStubHubUrl(event, suffix='?quantity=0') {
+  const eventId = event.id;
+
+  // Try to build slug from name + venue + date
+  if (event.name && event.date) {
+    try {
+      // Extract home team (after "at") or just use full name
+      const nameSlug = event.name
+        .toLowerCase()
+        .replace(/\s+at\s+/i, ' ')     // "X at Y" -> "X Y"
+        .replace(/[^a-z0-9\s]/g, '')   // remove special chars
+        .trim()
+        .replace(/\s+/g, '-');         // spaces to dashes
+
+      // Extract city from venue
+      let citySlug = '';
+      if (event.venue) {
+        const venueParts = event.venue.split(',');
+        if (venueParts.length >= 2) {
+          citySlug = venueParts[1].trim().toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '-');
+        }
+      }
+
+      // Build date slug M-D-YYYY
+      const d = new Date(event.date + 'T12:00:00');
+      const dateSlug = `${d.getMonth()+1}-${d.getDate()}-${d.getFullYear()}`;
+
+      const slug = citySlug
+        ? `${nameSlug}-${citySlug}-tickets-${dateSlug}`
+        : `${nameSlug}-tickets-${dateSlug}`;
+
+      return `https://www.stubhub.com/${slug}/event/${eventId}/${suffix}`;
+    } catch(_) {}
+  }
+
+  // Fallback to short URL
+  return `https://www.stubhub.com/event/${eventId}/${suffix}`;
+}
+
 async function getEvents() {
   const { data, error } = await supabase
     .from('events')
@@ -71,7 +112,7 @@ async function postSnapshot(payload) {
   } catch(e) { console.error('  Snapshot error:', e.message); return false; }
 }
 
-async function fetchWithWebUnlocker(targetUrl, referer) {
+async function fetchWithWebUnlocker(targetUrl) {
   console.log('  Fetching:', targetUrl);
   const res = await fetch('https://api.brightdata.com/request', {
     method: 'POST',
@@ -86,13 +127,6 @@ async function fetchWithWebUnlocker(targetUrl, referer) {
       headers: {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Referer': referer || 'https://www.google.com/',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'cross-site',
-        'Upgrade-Insecure-Requests': '1',
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
       }
     })
@@ -114,19 +148,13 @@ async function fetchWithWebUnlocker(targetUrl, referer) {
   return text;
 }
 
-// Check if HTML is the correct event page
 function isCorrectEventPage(html, eventId) {
-  if (!html) return false;
-  // Must contain the event ID
+  if (!html || html.length < 5000) return false;
   if (!html.includes(eventId)) return false;
-  // Must NOT be a generic schedule page
   const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
-  if (titleMatch) {
-    const title = titleMatch[1];
-    if (/Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(title)) {
-      console.log('  Wrong page — title:', title.slice(0, 80));
-      return false;
-    }
+  if (titleMatch && /Schedule|NFL \d{4}|NBA \d{4}|MLB \d{4}|NHL \d{4}/i.test(titleMatch[1])) {
+    console.log('  Wrong page title:', titleMatch[1].slice(0, 80));
+    return false;
   }
   return true;
 }
@@ -206,7 +234,6 @@ async function extractSectionPrices(page) {
   return await page.evaluate(({minPrice, maxPrice}) => {
     try {
       if (!document || !document.body) return { totalListings:0, prices:[], error:'no-body' };
-
       const bodyText = document.body.innerText || '';
 
       const secHeaderMatch = bodyText.match(/Section\s+[\w\d]+\s*\|\s*(\d[\d,]*)\s+listings?/i);
@@ -252,21 +279,22 @@ async function scrapeEvent(page, event) {
   const isMajor = event.is_major === true;
 
   try {
-    const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
-    let html = await fetchWithWebUnlocker(url, 'https://www.google.com/');
+    // Build full SEO URL to avoid redirect to team page
+    const url = buildStubHubUrl(event);
+    console.log('  URL:', url);
+    let html = await fetchWithWebUnlocker(url);
 
-    // If we got the wrong page, retry with stubhub.com as referer
+    // Fallback to short URL if SEO URL fails
     if (!isCorrectEventPage(html, eventId)) {
-      console.log('  Wrong page on first try, retrying with StubHub referer...');
-      html = await fetchWithWebUnlocker(url, 'https://www.stubhub.com/');
+      const shortUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0`;
+      console.log('  SEO URL failed, trying short URL...');
+      html = await fetchWithWebUnlocker(shortUrl);
     }
 
     if (!isCorrectEventPage(html, eventId)) {
-      console.log('  Still wrong page after retry, skipping '+eventId);
+      console.log('  Could not get correct page for '+eventId+', skipping');
       return null;
     }
-
-    if (!html || html.length < 5000) { console.log('  No usable HTML for '+eventId); return null; }
 
     await page.setContent(html, { waitUntil:'domcontentloaded' });
     await dismissModals(page);
@@ -303,8 +331,8 @@ async function scrapeEvent(page, event) {
 
       for (const secNum of sectionNumbers) {
         try {
-          const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${secNum}&quantity=0`;
-          const secHtml = await fetchWithWebUnlocker(secUrl, url);
+          const secUrl = buildStubHubUrl(event, `?sections=${secNum}&quantity=0`);
+          const secHtml = await fetchWithWebUnlocker(secUrl);
           if (!secHtml || secHtml.length < 5000) { console.log('    Section '+secNum+': no HTML'); continue; }
 
           await page.setContent(secHtml, { waitUntil:'domcontentloaded' });

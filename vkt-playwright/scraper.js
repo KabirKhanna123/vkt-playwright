@@ -1,24 +1,31 @@
+// --- DEBUG MARKER: if you don't see this line in logs, Node never started this file ---
+console.log('scraper.js starting...');
+
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { createClient } = require('@supabase/supabase-js');
 
 chromium.use(StealthPlugin());
 
+// Bright Data Web Unlocker
 const BRIGHTDATA_API_TOKEN = process.env.BRIGHTDATA_API_TOKEN || 'ac7d557e-67eb-4e04-90ef-56b1db829ab7';
 const WEB_UNLOCKER_ZONE    = process.env.WEB_UNLOCKER_ZONE    || 'web_unlocker1';
 
+// Supabase & Vercel API
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
 const VKT_API      = process.env.VKT_API      || 'https://vkt-volume-api.vercel.app';
 
+// Timings & price filters
 const SCRAPE_DELAY_MS  = parseInt(process.env.SCRAPE_DELAY_MS  || '5000', 10);
 const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '3000', 10);
 const RECENT_HOURS     = parseInt(process.env.RECENT_HOURS     || '20',   10);
-const EVENT_LIMIT      = parseInt(process.env.EVENT_LIMIT      || '200',  10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ---------- Helpers ----------
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function randomDelay(min, max) { return sleep(min + Math.random() * (max - min)); }
@@ -37,7 +44,10 @@ function normalizeDateString(value) {
 }
 
 function summarizePrices(prices) {
-  const valid = (prices||[]).map(safeNum).filter(v => v >= MIN_PRICE && v <= MAX_PRICE).sort((a,b) => a-b);
+  const valid = (prices||[])
+    .map(safeNum)
+    .filter(v => v >= MIN_PRICE && v <= MAX_PRICE)
+    .sort((a,b) => a-b);
   if (!valid.length) return { floor:null, avg:null, ceiling:null };
   return {
     floor:   Math.round(valid[0]),
@@ -46,33 +56,58 @@ function summarizePrices(prices) {
   };
 }
 
+// ---------- Supabase: ONLY event 160425611 ----------
+
 async function getEvents() {
+  console.log('[getEvents] TEST MODE: only event 160425611');
   const { data, error } = await supabase
     .from('events')
     .select('id,name,date,venue,platform,is_major')
-    .not('id', 'like', 'tm_%')
-    .order('date', { ascending: true })
-    .limit(EVENT_LIMIT);
-  if (error) { console.error('Failed to fetch events:', error.message); return []; }
+    .eq('id', '160425611')   // only this event
+    .limit(1);
+
+  if (error) {
+    console.error('Failed to fetch events:', error.message);
+    return [];
+  }
   return data || [];
 }
 
 async function scrapedRecently(eventId, hours=RECENT_HOURS) {
   const since = new Date(Date.now() - hours*3600000).toISOString();
-  const { data } = await supabase.from('volume_snapshots').select('id').eq('event_id', eventId).is('section', null).gte('scraped_at', since).limit(1);
+  const { data } = await supabase
+    .from('volume_snapshots')
+    .select('id')
+    .eq('event_id', eventId)
+    .is('section', null)
+    .gte('scraped_at', since)
+    .limit(1);
   return !!(data && data.length > 0);
 }
 
 async function postSnapshot(payload) {
   try {
-    const r = await fetch(VKT_API+'/api/snapshot', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
-    if (!r.ok) { console.error('  Snapshot failed:', r.status, await r.text()); return false; }
+    const r = await fetch(VKT_API + '/api/snapshot', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)
+    });
+    if (!r.ok) {
+      console.error('  Snapshot failed:', r.status, await r.text());
+      return false;
+    }
     return true;
-  } catch(e) { console.error('  Snapshot error:', e.message); return false; }
+  } catch(e) {
+    console.error('  Snapshot error:', e.message);
+    return false;
+  }
 }
 
+// ---------- Web Unlocker ----------
+
 async function fetchWithWebUnlocker(targetUrl) {
-  console.log('  Fetching:', targetUrl);
+  console.log('  Fetching via Web Unlocker:', targetUrl);
+
   const res = await fetch('https://api.brightdata.com/request', {
     method: 'POST',
     headers: {
@@ -95,18 +130,31 @@ async function fetchWithWebUnlocker(targetUrl) {
   try {
     const json = JSON.parse(text);
     const html = json.body || json.html || json.content || null;
-    if (html) { console.log('  HTML length:', html.length); return html; }
+    if (html) {
+      console.log('  HTML length:', html.length);
+      return html;
+    }
   } catch(_) {}
 
   console.log('  Raw HTML length:', text.length);
   return text;
 }
 
+// ---------- Playwright helpers ----------
+
 async function dismissModals(page) {
-  for (const sel of ['button:has-text("Accept")','button:has-text("Continue")','button:has-text("Close")','button[aria-label="Close"]']) {
+  for (const sel of [
+    'button:has-text("Accept")',
+    'button:has-text("Continue")',
+    'button:has-text("Close")',
+    'button[aria-label="Close"]'
+  ]) {
     try {
       const el = page.locator(sel).first();
-      if (await el.isVisible({timeout:500})) { await el.click({timeout:700}); await page.waitForTimeout(300); }
+      if (await el.isVisible({timeout:500})) {
+        await el.click({timeout:700});
+        await page.waitForTimeout(300);
+      }
     } catch(_) {}
   }
 }
@@ -217,122 +265,163 @@ async function extractSectionPrices(page) {
   }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
 }
 
+// ---------- Main per‑event logic ----------
+
 async function scrapeEvent(page, event) {
   const eventId = event.id;
-  const originalName = event.name || 'Event '+eventId;
+  const originalName = event.name || 'Event ' + eventId;
   const isMajor = event.is_major === true;
 
   try {
-    const url = 'https://www.stubhub.com/event/'+eventId+'/?quantity=0';
+    const url = 'https://www.stubhub.com/event/' + eventId + '/?quantity=0';
     const html = await fetchWithWebUnlocker(url);
-    if (!html || html.length < 5000) { console.log('  No usable HTML for '+eventId); return null; }
+    if (!html || html.length < 5000) {
+      console.error('  HTML too short or empty for event', eventId, 'length=', html ? html.length : 0);
+      return;
+    }
 
-    await page.setContent(html, { waitUntil:'domcontentloaded' });
+    await page.setContent(html, { waitUntil: 'domcontentloaded' });
     await dismissModals(page);
 
     const data = await extractPageData(page);
-    let name = data.name || originalName;
-    if (name && name.toLowerCase().includes('tickets')) name = originalName;
+    let name  = data.name  || originalName;
     const venue = data.venue || event.venue || null;
-    const date = normalizeDateString(data.date) || event.date || null;
+    const date  = normalizeDateString(data.date) || event.date || null;
     const { totalListings, prices, sectionNumbers } = data;
 
-    const summary = summarizePrices(prices);
-    if (!summary.floor) { console.log('  No pricing for '+name); return null; }
+    if (name && name.toLowerCase().includes('tickets')) name = originalName;
 
-    console.log('  '+name+' | '+date+' | '+venue);
-    console.log('  '+totalListings+' listings, floor $'+summary.floor+', atp $'+summary.avg+(isMajor?' [MAJOR]':''));
+    const summary = summarizePrices(prices);
+    if (!summary.floor) {
+      console.log('  No valid pricing found for', name);
+      return;
+    }
+
+    console.log(`  ${name} | ${date} | ${venue}`);
+    console.log(`  ${totalListings} listings, floor $${summary.floor}, atp $${summary.avg}${isMajor ? ' [MAJOR]' : ''}`);
 
     await postSnapshot({
-      eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
-      totalListings, section:null, sectionListings:0,
-      eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
-      source:'brightdata'
+      eventId,
+      eventName: name,
+      eventDate: date,
+      venue,
+      platform: 'StubHub',
+      totalListings,
+      section: null,
+      sectionListings: 0,
+      eventFloor: summary.floor,
+      eventAvg: summary.avg,
+      eventCeiling: summary.ceiling,
+      source: 'playwright+web_unlocker'
     });
 
     const updates = {};
     if (name !== originalName) updates.name = name;
     if (venue && venue !== event.venue) updates.venue = venue;
     if (date && date !== event.date) updates.date = date;
-    if (Object.keys(updates).length) await supabase.from('events').update(updates).eq('id', eventId);
+    if (Object.keys(updates).length) {
+      await supabase.from('events').update(updates).eq('id', eventId);
+    }
 
     if (isMajor && sectionNumbers.length > 0) {
-      console.log('  Scraping '+sectionNumbers.length+' sections...');
-      let postedSections = 0;
+      console.log(`  Scraping ${sectionNumbers.length} sections:`, sectionNumbers);
 
-      for (const secNum of sectionNumbers) {
+      for (const section of sectionNumbers) {
         try {
-          const secUrl = `https://www.stubhub.com/event/${eventId}/?sections=${secNum}&quantity=0`;
-          const secHtml = await fetchWithWebUnlocker(secUrl);
-          if (!secHtml || secHtml.length < 5000) { console.log('    Section '+secNum+': no HTML'); continue; }
+          const sectionUrl = `https://www.stubhub.com/event/${eventId}/?quantity=0&sections=${encodeURIComponent(section)}`;
+          const secHtml = await fetchWithWebUnlocker(sectionUrl);
+          if (!secHtml || secHtml.length < 5000) {
+            console.error(`    Section ${section}: HTML too short or empty, length=`, secHtml ? secHtml.length : 0);
+            continue;
+          }
 
-          await page.setContent(secHtml, { waitUntil:'domcontentloaded' });
+          await page.setContent(secHtml, { waitUntil: 'domcontentloaded' });
           await dismissModals(page);
 
           const secResult = await extractSectionPrices(page);
-          if (secResult.error) { console.log('    Section '+secNum+': error — '+secResult.error); continue; }
+          if (secResult.error) {
+            console.warn(`    Section ${section}: extractSectionPrices error:`, secResult.error);
+          }
 
-          const { totalListings: secTotal, prices: secPrices } = secResult;
-          const secSummary = summarizePrices(secPrices);
-          if (!secSummary.floor) { console.log('    Section '+secNum+': no valid prices'); continue; }
+          const { totalListings: sectionListings, prices: sectionPrices } = secResult;
+          const secSummary = summarizePrices(sectionPrices);
+          if (!secSummary.floor) {
+            console.log(`    Section ${section}: no valid prices`);
+            continue;
+          }
 
-          const ok = await postSnapshot({
-            eventId, eventName:name, eventDate:date, venue, platform:'StubHub',
-            totalListings:0, section:'Section '+secNum, sectionListings:secTotal,
-            sectionFloor:secSummary.floor, sectionAvg:secSummary.avg, sectionCeiling:secSummary.ceiling,
-            eventFloor:summary.floor, eventAvg:summary.avg, eventCeiling:summary.ceiling,
-            source:'brightdata'
+          console.log(`    Section ${section}: ${sectionListings} listings, floor $${secSummary.floor}, atp $${secSummary.avg}`);
+
+          await postSnapshot({
+            eventId,
+            eventName: name,
+            eventDate: date,
+            venue,
+            platform: 'StubHub',
+            totalListings,
+            section,
+            sectionListings,
+            eventFloor: summary.floor,
+            eventAvg: summary.avg,
+            eventCeiling: summary.ceiling,
+            sectionFloor: secSummary.floor,
+            sectionAvg: secSummary.avg,
+            sectionCeiling: secSummary.ceiling,
+            source: 'playwright+web_unlocker'
           });
 
-          if (ok) { postedSections++; console.log('    Section '+secNum+': '+secTotal+' listings, floor $'+secSummary.floor); }
-          await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 1500);
-        } catch(e) { console.error('    Section '+secNum+' failed:', e.message); }
+          await randomDelay(SECTION_DELAY_MS, SECTION_DELAY_MS + 2000);
+        } catch(e) {
+          console.error(`    Section ${section} error:`, e.message);
+        }
       }
-      console.log('  Sections posted: '+postedSections+'/'+sectionNumbers.length);
+    } else {
+      console.log(`  Skipping section-level scraping (is_major=${isMajor}, sections found=${sectionNumbers.length})`);
     }
-
-    return { ok:true };
-
-  } catch(e) { console.error('  Failed '+eventId+':', e.message); return null; }
+  } catch(e) {
+    console.error(`  Error scraping event ${eventId}:`, e);
+  }
 }
 
+// ---------- Entrypoint ----------
+
 async function main() {
-  console.log('VKT Playwright scraper starting...');
+  console.log('VKT Playwright scraper starting (with Web Unlocker, TEST event 160425611)...');
 
-  const manualId = process.argv[2];
-  let events = manualId
-    ? [{ id:manualId, name:'Manual', date:null, venue:null, platform:'StubHub', is_major:true }]
-    : await getEvents();
-  console.log('Events to process: '+events.length);
+  const events = await getEvents();
+  console.log('Events to process:', events.length);
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--no-first-run','--no-zygote','--disable-gpu']
-  });
+  if (!events.length) {
+    console.log('No events found (check Supabase row for id 160425611)');
+    return;
+  }
 
-  const context = await browser.newContext({
-    viewport: { width:1280, height:900 },
-    locale: 'en-US',
-    timezoneId: 'America/New_York'
-  });
-
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
   const page = await context.newPage();
 
-  let scraped=0, skipped=0, failed=0;
+  page.on('console', msg => {
+    if (msg.type() === 'error') console.error('PAGE ERROR:', msg.text());
+  });
 
   for (const event of events) {
-    if (!manualId) {
-      const recent = await scrapedRecently(event.id);
-      if (recent) { console.log('Skipping '+event.name+' (recent)'); skipped++; continue; }
-    }
-    console.log('\nScraping: '+event.name+' ('+event.id+')');
-    const result = await scrapeEvent(page, event);
-    if (result) scraped++; else failed++;
-    await randomDelay(SCRAPE_DELAY_MS, SCRAPE_DELAY_MS + 2000);
+    const eventId = event.id;
+    console.log(`\n=== Scraping: ${event.name || eventId} (${eventId}) ===`);
+
+    const recently = await scrapedRecently(eventId);
+    console.log('  scrapedRecently:', recently);
+
+    await scrapeEvent(page, event);
+    await randomDelay(SCRAPE_DELAY_MS, SCRAPE_DELAY_MS + 3000);
   }
 
   await browser.close();
-  console.log('\nDone — scraped:'+scraped+' skipped:'+skipped+' failed:'+failed);
+  console.log('Done.');
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+if (require.main === module) {
+  main().catch(e => {
+    console.error('Fatal error:', e);
+    process.exit(1);
+  });
+}

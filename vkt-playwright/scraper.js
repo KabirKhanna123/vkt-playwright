@@ -1,4 +1,3 @@
-// --- DEBUG MARKER: if you don't see this line in logs, Node never started this file ---
 console.log('scraper.js starting...');
 
 const { chromium } = require('playwright-extra');
@@ -22,6 +21,9 @@ const SECTION_DELAY_MS = parseInt(process.env.SECTION_DELAY_MS || '3000', 10);
 const RECENT_HOURS     = parseInt(process.env.RECENT_HOURS     || '20',   10);
 const MIN_PRICE = 10;
 const MAX_PRICE = 25000;
+
+// StubHub ticket row selector (adjust if needed)
+const TICKET_ROW_SELECTOR = 'div[role="button"][data-index][data-listing-id]';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -159,10 +161,13 @@ async function dismissModals(page) {
   }
 }
 
+// ---------- Extraction using StubHub ticket rows ----------
+
 async function extractPageData(page) {
-  return await page.evaluate(({minPrice, maxPrice}) => {
+  return await page.evaluate(({minPrice, maxPrice, ticketRowSelector}) => {
     let name = null, date = null, venue = null;
 
+    // JSON-LD metadata
     const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
     for (const script of scripts) {
       try {
@@ -184,30 +189,29 @@ async function extractPageData(page) {
       if (name && date && venue) break;
     }
 
-    const bodyText = document.body?.innerText || '';
-
-    const listingMatches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
-      .map(m => parseInt(m[1].replace(/,/g,''), 10))
-      .filter(v => Number.isFinite(v) && v > 0);
-    const totalListings = listingMatches.length ? Math.max(...listingMatches) : 0;
+    // Ticket rows
+    const rows = ticketRowSelector
+      ? Array.from(document.querySelectorAll(ticketRowSelector))
+      : [];
+    const totalListings = rows.length;
 
     const prices = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
+    for (const row of rows) {
       try {
-        if (!node.parentElement) continue;
-        if (node.parentElement.closest('script,style,noscript,svg')) continue;
-        const style = window.getComputedStyle(node.parentElement);
-        if (style.display === 'none' || style.visibility === 'hidden') continue;
-        for (const match of node.textContent.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
+        const text = row.innerText || '';
+        if (!text.includes('$')) continue;
+        for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
           const value = parseFloat(match[1].replace(/,/g,''));
-          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
+          if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) {
+            prices.push(value);
+          }
         }
       } catch(_) { continue; }
     }
     prices.sort((a,b) => a-b);
 
+    // Section numbers (heuristic)
+    const bodyText = document.body?.innerText || '';
     const sectionNumbers = new Set();
     const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
     for (const line of lines) {
@@ -218,41 +222,29 @@ async function extractPageData(page) {
     }
 
     return { name, date, venue, totalListings, prices, sectionNumbers: Array.from(sectionNumbers) };
-  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
+  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE, ticketRowSelector: TICKET_ROW_SELECTOR});
 }
 
 async function extractSectionPrices(page) {
-  return await page.evaluate(({minPrice, maxPrice}) => {
+  return await page.evaluate(({minPrice, maxPrice, ticketRowSelector}) => {
     try {
       if (!document || !document.body) return { totalListings:0, prices:[], error:'no-body' };
 
-      const bodyText = document.body.innerText || '';
-
-      const secHeaderMatch = bodyText.match(/Section\s+[\w\d]+\s*\|\s*(\d[\d,]*)\s+listings?/i);
-      let totalListings = secHeaderMatch ? parseInt(secHeaderMatch[1].replace(/,/g,''), 10) : 0;
-
-      if (!totalListings) {
-        const matches = [...bodyText.matchAll(/\b(\d[\d,]*)\s+listings?\b/gi)]
-          .map(m => parseInt(m[1].replace(/,/g,''), 10))
-          .filter(v => Number.isFinite(v) && v > 0 && v < 500);
-        totalListings = matches.length ? Math.min(...matches) : 0;
-      }
+      const rows = ticketRowSelector
+        ? Array.from(document.querySelectorAll(ticketRowSelector))
+        : [];
+      const totalListings = rows.length;
 
       const prices = [];
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      let node;
-      while ((node = walker.nextNode())) {
+      for (const row of rows) {
         try {
-          if (!node.parentElement) continue;
-          if (node.parentElement.closest('script,style,noscript,svg')) continue;
-          let style;
-          try { style = window.getComputedStyle(node.parentElement); } catch { continue; }
-          if (!style || style.display === 'none' || style.visibility === 'hidden') continue;
-          const text = node.textContent || '';
+          const text = row.innerText || '';
           if (!text.includes('$')) continue;
           for (const match of text.matchAll(/\$\s*([\d,]+(?:\.\d{2})?)/g)) {
             const value = parseFloat(match[1].replace(/,/g,''));
-            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) prices.push(value);
+            if (Number.isFinite(value) && value >= minPrice && value <= maxPrice) {
+              prices.push(value);
+            }
           }
         } catch { continue; }
       }
@@ -262,7 +254,7 @@ async function extractSectionPrices(page) {
     } catch(e) {
       return { totalListings:0, prices:[], error: e?.message || 'unknown' };
     }
-  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE});
+  }, {minPrice: MIN_PRICE, maxPrice: MAX_PRICE, ticketRowSelector: TICKET_ROW_SELECTOR});
 }
 
 // ---------- Main per‑event logic ----------

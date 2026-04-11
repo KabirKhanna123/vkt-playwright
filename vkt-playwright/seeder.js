@@ -4,227 +4,208 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://unypasitbzulafehbqtj.s
 const SUPABASE_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVueXBhc2l0Ynp1bGFmZWhicXRqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMTE2MjAsImV4cCI6MjA5MDU4NzYyMH0.ywGB7ZccbVxcgZDXMOQB9Ui8R-SF4xF0SKkWavDbRGI';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const SKIP = [
-  'hotel', 'parking', 'vip-package', 'meet-greet', 'merchandise',
-  'gift-card', 'voucher', 'package-deal'
-];
+// High-value search queries — each will be searched on StubHub
+const SEARCHES = [
+  // FIFA World Cup 2026
+  { query: 'FIFA World Cup 2026', is_major: true, category: 'fifa' },
+  { query: 'World Cup 2026 match', is_major: true, category: 'fifa' },
 
-const MAJOR_KEYWORDS = [
   // NFL
-  'patriots', 'cowboys', 'chiefs', 'packers', '49ers', 'eagles', 'giants',
-  'ravens', 'steelers', 'broncos', 'bears', 'lions', 'falcons', 'saints',
-  'buccaneers', 'panthers', 'cardinals', 'seahawks', 'rams', 'chargers',
-  'raiders', 'dolphins', 'bills', 'jets', 'browns', 'bengals', 'colts',
-  'titans', 'jaguars', 'texans', 'vikings', 'commanders',
-  // MLB
-  'yankees', 'dodgers', 'red-sox', 'cubs', 'mets', 'astros', 'braves',
-  'phillies', 'padres', 'athletics', 'rangers', 'mariners', 'angels',
-  'tigers', 'twins', 'white-sox', 'guardians', 'royals', 'pirates',
-  'reds', 'rockies', 'diamondbacks', 'orioles', 'blue-jays', 'rays',
-  'nationals', 'marlins', 'brewers',
+  { query: 'Super Bowl 2026', is_major: true, category: 'nfl' },
+  { query: 'NFL playoff 2026', is_major: true, category: 'nfl' },
+  { query: 'NFC Championship 2026', is_major: true, category: 'nfl' },
+  { query: 'AFC Championship 2026', is_major: true, category: 'nfl' },
+  { query: 'Kansas City Chiefs 2026', is_major: true, category: 'nfl' },
+  { query: 'Dallas Cowboys 2026', is_major: true, category: 'nfl' },
+  { query: 'Philadelphia Eagles 2026', is_major: true, category: 'nfl' },
+  { query: 'San Francisco 49ers 2026', is_major: true, category: 'nfl' },
+  { query: 'Buffalo Bills 2026', is_major: true, category: 'nfl' },
+  { query: 'Green Bay Packers 2026', is_major: true, category: 'nfl' },
+
   // NBA
-  'lakers', 'celtics', 'warriors', 'knicks', 'bulls', 'heat', 'nets',
-  '76ers', 'bucks', 'nuggets', 'suns', 'mavericks', 'clippers', 'raptors',
-  'spurs', 'thunder', 'jazz', 'blazers', 'rockets', 'pelicans', 'grizzlies',
-  'hawks', 'hornets', 'pacers', 'pistons', 'wizards', 'magic', 'cavaliers',
-  'timberwolves', 'kings',
-  // NHL
-  'bruins', 'maple-leafs', 'blackhawks', 'penguins', 'capitals',
-  'lightning', 'avalanche', 'golden-knights', 'oilers', 'flames', 'canucks',
-  'canadiens', 'senators', 'sabres', 'red-wings', 'blues', 'predators',
-  'coyotes', 'sharks', 'ducks', 'stars', 'wild', 'jets',
-  'hurricanes', 'blue-jackets', 'devils', 'islanders',
-  // Concerts / Events
-  'taylor-swift', 'beyonce', 'drake', 'bad-bunny', 'kendrick-lamar',
-  'super-bowl', 'world-series', 'nba-finals', 'stanley-cup',
-  'coachella', 'lollapalooza', 'wrestlemania', 'ufc'
+  { query: 'NBA Finals 2026', is_major: true, category: 'nba' },
+  { query: 'NBA playoff 2026', is_major: true, category: 'nba' },
+  { query: 'Los Angeles Lakers 2026', is_major: true, category: 'nba' },
+  { query: 'Boston Celtics 2026', is_major: true, category: 'nba' },
+  { query: 'Golden State Warriors 2026', is_major: true, category: 'nba' },
+  { query: 'New York Knicks 2026', is_major: true, category: 'nba' },
+
+  // MLB
+  { query: 'World Series 2026', is_major: true, category: 'mlb' },
+  { query: 'MLB playoff 2026', is_major: true, category: 'mlb' },
+  { query: 'New York Yankees 2026', is_major: true, category: 'mlb' },
+  { query: 'Los Angeles Dodgers 2026', is_major: true, category: 'mlb' },
+  { query: 'Chicago Cubs 2026', is_major: true, category: 'mlb' },
+  { query: 'Boston Red Sox 2026', is_major: true, category: 'mlb' },
+  { query: 'New York Mets 2026', is_major: true, category: 'mlb' },
+
+  // UFC
+  { query: 'UFC 300', is_major: true, category: 'ufc' },
+  { query: 'UFC 301', is_major: true, category: 'ufc' },
+  { query: 'UFC 302', is_major: true, category: 'ufc' },
+  { query: 'UFC 303', is_major: true, category: 'ufc' },
+  { query: 'UFC PPV 2026', is_major: true, category: 'ufc' },
+  { query: 'UFC championship 2026', is_major: true, category: 'ufc' },
+
+  // Boxing
+  { query: 'boxing championship 2026', is_major: true, category: 'boxing' },
+  { query: 'heavyweight championship 2026', is_major: true, category: 'boxing' },
+  { query: 'Canelo 2026', is_major: true, category: 'boxing' },
+
+  // Concerts
+  { query: 'Taylor Swift 2026', is_major: true, category: 'concert' },
+  { query: 'Beyonce 2026', is_major: true, category: 'concert' },
+  { query: 'Drake 2026', is_major: true, category: 'concert' },
+  { query: 'Bad Bunny 2026', is_major: true, category: 'concert' },
+  { query: 'Kendrick Lamar 2026', is_major: true, category: 'concert' },
+  { query: 'Coldplay 2026', is_major: true, category: 'concert' },
+  { query: 'The Weeknd 2026', is_major: true, category: 'concert' },
+
+  // Festivals
+  { query: 'Coachella 2026', is_major: true, category: 'festival' },
+  { query: 'EDC Las Vegas 2026', is_major: true, category: 'festival' },
+  { query: 'Ultra Music Festival 2026', is_major: true, category: 'festival' },
+  { query: 'Lollapalooza 2026', is_major: true, category: 'festival' },
+
+  // Broadway
+  { query: 'Hamilton Broadway 2026', is_major: true, category: 'broadway' },
+  { query: 'Lion King Broadway 2026', is_major: true, category: 'broadway' },
+  { query: 'Wicked Broadway 2026', is_major: true, category: 'broadway' },
+
+  // F1
+  { query: 'Formula 1 2026 United States Grand Prix', is_major: true, category: 'f1' },
+  { query: 'Formula 1 2026 Las Vegas Grand Prix', is_major: true, category: 'f1' },
+  { query: 'Formula 1 2026 Miami Grand Prix', is_major: true, category: 'f1' },
+  { query: 'F1 Grand Prix 2026', is_major: true, category: 'f1' },
+
+  // College Football
+  { query: 'College Football Playoff 2026', is_major: true, category: 'cfb' },
+  { query: 'CFP National Championship 2026', is_major: true, category: 'cfb' },
+  { query: 'Rose Bowl 2026', is_major: true, category: 'cfb' },
+  { query: 'Sugar Bowl 2026', is_major: true, category: 'cfb' },
+  { query: 'Alabama football 2026', is_major: true, category: 'cfb' },
+  { query: 'Ohio State football 2026', is_major: true, category: 'cfb' },
+  { query: 'Michigan football 2026', is_major: true, category: 'cfb' },
+  { query: 'Georgia football 2026', is_major: true, category: 'cfb' },
 ];
 
-function isMajorEvent(url, name) {
-  const check = (url + ' ' + (name || '')).toLowerCase();
-  return MAJOR_KEYWORDS.some(k => check.includes(k));
-}
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-function extractEventId(url) {
-  const m = url.match(/\/event\/(\d{5,})/);
-  return m ? m[1] : null;
-}
-
-function isEventUrl(url) {
-  if (!url.includes('stubhub.com')) return false;
-  if (!url.includes('/event/')) return false;
-  const lower = url.toLowerCase();
-  return !SKIP.some(s => lower.includes(s));
-}
-
-function nameFromUrl(url) {
-  const parts = url.split('/').filter(Boolean);
-  const slug = parts.find(p => p.includes('-tickets-') || (p.length > 10 && p.includes('-'))) || '';
-  return slug
-    .replace(/-\d{1,2}-\d{4}.*$/, '')
-    .replace(/-tickets.*$/, '')
-    .replace(/-/g, ' ')
-    .replace(/\b\w/g, c => c.toUpperCase())
-    .trim() || 'StubHub Event';
-}
-
-function dateFromUrl(url) {
-  const m = url.match(/-(\d{1,2})-(\d{1,2})-(\d{4})/);
-  if (m) {
-    const month = m[1].padStart(2, '0');
-    const day   = m[2].padStart(2, '0');
-    const year  = m[3];
-    if (parseInt(year) >= 2025) return `${year}-${month}-${day}`;
-  }
-  return null;
-}
-
-async function fetchText(url) {
-  const resp = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': 'text/xml,application/xml,*/*'
-    }
-  });
-  if (!resp.ok) throw new Error('HTTP ' + resp.status);
-  return resp.text();
-}
-
-function extractUrls(xml) {
-  const urls = [];
-  const re = /<loc>(.*?)<\/loc>/g;
+function extractEventIds(html) {
+  const ids = new Set();
+  // Match /event/XXXXXXX/ patterns
+  const re = /\/event\/(\d{5,})\//g;
   let m;
-  while ((m = re.exec(xml)) !== null) urls.push(m[1].trim());
-  return urls;
+  while ((m = re.exec(html)) !== null) ids.add(m[1]);
+  return [...ids];
+}
+
+function extractEventData(html, eventId) {
+  // Try to get name from og:title or title tag
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+  const title = titleMatch ? titleMatch[1].replace(/ [\|\-] StubHub.*$/i, '').replace(/ Tickets.*$/i, '').trim() : null;
+
+  // Try to get date from URL or JSON-LD
+  const dateMatch = html.match(/"startDate"\s*:\s*"([^"]+)"/);
+  const date = dateMatch ? dateMatch[1].split('T')[0] : null;
+
+  // Try to get venue
+  const venueMatch = html.match(/"name"\s*:\s*"([^"]+)"[^}]*"@type"\s*:\s*"Place"/) ||
+                     html.match(/"@type"\s*:\s*"Place"[^}]*"name"\s*:\s*"([^"]+)"/);
+  const venue = venueMatch ? venueMatch[1] : null;
+
+  return { name: title, date, venue };
+}
+
+async function searchStubHub(query) {
+  const encoded = encodeURIComponent(query);
+  const url = `https://www.stubhub.com/search/?q=${encoded}`;
+
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      }
+    });
+    if (!resp.ok) return [];
+    const html = await resp.text();
+    return extractEventIds(html);
+  } catch(e) {
+    console.log(`  Search failed for "${query}": ${e.message}`);
+    return [];
+  }
+}
+
+async function fetchEventPage(eventId) {
+  const url = `https://www.stubhub.com/event/${eventId}/`;
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+      }
+    });
+    if (!resp.ok) return null;
+    return resp.text();
+  } catch(_) { return null; }
 }
 
 async function main() {
-  console.log('Sitemap seeder starting...');
+  console.log('Targeted seeder starting...');
 
-  let allEventUrls = [];
+  // Get existing IDs
+  const { data: existingData } = await supabase.from('events').select('id');
+  const existingIds = new Set((existingData || []).map(r => r.id));
+  console.log(`Existing events in DB: ${existingIds.size}`);
 
-  // Try event-level sitemaps directly
-  const eventSitemapBases = [
-    'https://www.stubhub.com/new-sitemap/us/US-en-event-',
-    'https://www.stubhub.com/sitemap/us/en/event-',
-    'https://www.stubhub.com/sitemaps/us-en-event-',
-  ];
+  const discovered = new Map(); // id -> { is_major, category }
 
-  let foundEventSitemap = false;
+  // Search StubHub for each query
+  for (const search of SEARCHES) {
+    console.log(`\nSearching: "${search.query}"`);
+    const ids = await searchStubHub(search.query);
+    console.log(`  Found ${ids.length} event IDs`);
 
-  for (const base of eventSitemapBases) {
-    console.log(`Trying sitemap base: ${base}`);
-    for (let i = 0; i <= 5; i++) {
-      const url = `${base}${i}.xml`;
-      try {
-        const xml = await fetchText(url);
-        const urls = extractUrls(xml).filter(isEventUrl);
-        if (urls.length > 0) {
-          console.log(`  Found ${urls.length} event URLs at ${url}`);
-          allEventUrls = allEventUrls.concat(urls);
-          foundEventSitemap = true;
-        }
-      } catch(_) {}
-    }
-    if (foundEventSitemap) break;
-  }
-
-  // Fallback: fetch grouping pages and extract event links from them
-  if (!foundEventSitemap || allEventUrls.length === 0) {
-    console.log('Event sitemaps not found, fetching from grouping pages...');
-
-    const groupingSitemaps = [];
-    for (let i = 0; i <= 4; i++) {
-      groupingSitemaps.push(`https://www.stubhub.com/new-sitemap/us/US-en-grouping-${i}.xml`);
-    }
-
-    const groupingUrls = [];
-    for (const s of groupingSitemaps) {
-      try {
-        console.log(`Fetching grouping sitemap: ${s}`);
-        const xml = await fetchText(s);
-        const urls = extractUrls(xml);
-        if (urls.length === 0) break;
-        // Only keep major groupings
-        const majorGroupings = urls.filter(u => isMajorEvent(u, ''));
-        console.log(`  ${urls.length} groupings, ${majorGroupings.length} major`);
-        groupingUrls.push(...majorGroupings);
-      } catch(e) {
-        console.log(`  Failed: ${e.message}`);
-        break;
+    for (const id of ids) {
+      if (!discovered.has(id)) {
+        discovered.set(id, { is_major: search.is_major, category: search.category });
       }
     }
 
-    console.log(`Fetching event pages from ${groupingUrls.length} major groupings...`);
-
-    for (const groupUrl of groupingUrls.slice(0, 100)) {
-      try {
-        const html = await fetchText(groupUrl);
-        // Extract event IDs from grouping page HTML
-        const eventMatches = [...html.matchAll(/\/event\/(\d{5,})\//g)];
-        const ids = [...new Set(eventMatches.map(m => m[1]))];
-        for (const id of ids) {
-          allEventUrls.push(`https://www.stubhub.com/event/${id}/`);
-        }
-        if (ids.length > 0) console.log(`  ${groupUrl.split('/').slice(-2)[0]}: ${ids.length} events`);
-      } catch(_) {}
-    }
+    await sleep(1000 + Math.random() * 500);
   }
 
-  console.log(`Total event URLs found: ${allEventUrls.length}`);
+  console.log(`\nTotal unique events discovered: ${discovered.size}`);
 
-  // Dedupe by event ID
-  const seen = {};
-  const unique = [];
-  for (const url of allEventUrls) {
-    const id = extractEventId(url);
-    if (id && !seen[id]) {
-      seen[id] = true;
-      unique.push({ id, url });
-    }
-  }
-  console.log(`Unique events: ${unique.length}`);
-
-  // Batch check existing
-  const existingIds = new Set();
-  for (let i = 0; i < unique.length; i += 100) {
-    const batch = unique.slice(i, i + 100).map(e => e.id);
-    const { data } = await supabase.from('events').select('id').in('id', batch);
-    if (data) data.forEach(r => existingIds.add(r.id));
-  }
-  console.log(`Already in DB: ${existingIds.size}`);
-
-  const toSeed = unique.filter(e => !existingIds.has(e.id));
-  console.log(`To seed: ${toSeed.length}`);
+  const toSeed = [...discovered.entries()].filter(([id]) => !existingIds.has(id));
+  console.log(`New events to seed: ${toSeed.length}`);
 
   let seeded = 0;
-  let majorCount = 0;
   const insertBatch = [];
 
-  for (const ev of toSeed) {
-    const name = nameFromUrl(ev.url);
-    const is_major = isMajorEvent(ev.url, name);
-    if (is_major) majorCount++;
-
+  for (const [eventId, meta] of toSeed) {
     insertBatch.push({
-      id: ev.id,
-      name,
-      date: dateFromUrl(ev.url),
+      id: eventId,
+      name: `Event ${eventId}`,
+      date: null,
       venue: null,
       platform: 'StubHub',
-      is_major,
+      is_major: meta.is_major,
       updated_at: new Date().toISOString()
     });
 
-    if (insertBatch.length >= 100) {
+    if (insertBatch.length >= 50) {
       const { error } = await supabase.from('events').upsert(insertBatch, { onConflict: 'id' });
       if (!error) {
         seeded += insertBatch.length;
-        console.log(`Seeded ${seeded} (major: ${majorCount})`);
+        console.log(`Seeded ${seeded} events so far...`);
       } else {
         console.log('Batch error:', error.message);
       }
       insertBatch.length = 0;
+      await sleep(500);
     }
   }
 
@@ -233,25 +214,40 @@ async function main() {
     if (!error) seeded += insertBatch.length;
   }
 
-  console.log(`Done: ${seeded} new events seeded, ${majorCount} marked as major`);
+  console.log(`\nDone: ${seeded} new events seeded`);
 
-  // Backfill is_major on existing events
-  console.log('Backfilling is_major on existing events...');
-  const { data: existing } = await supabase
+  // Also backfill is_major on existing events with null
+  console.log('\nBackfilling is_major on existing events...');
+  const MAJOR_TERMS = [
+    'world cup', 'super bowl', 'nfl playoff', 'nba final', 'nba playoff',
+    'world series', 'mlb playoff', 'ufc', 'boxing championship',
+    'taylor swift', 'beyonce', 'drake', 'bad bunny', 'kendrick',
+    'coachella', 'edc', 'ultra', 'lollapalooza',
+    'formula 1', 'grand prix', 'college football playoff', 'cfp',
+    'patriots', 'cowboys', 'chiefs', 'eagles', 'bills', 'packers',
+    'lakers', 'celtics', 'warriors', 'knicks',
+    'yankees', 'dodgers', 'cubs', 'red sox', 'mets',
+    'bruins', 'penguins', 'blackhawks', 'maple leafs'
+  ];
+
+  const { data: nullMajor } = await supabase
     .from('events')
     .select('id,name')
     .is('is_major', null)
     .limit(5000);
 
-  if (existing && existing.length > 0) {
-    const toUpdate = existing.filter(e => isMajorEvent('', e.name)).map(e => e.id);
-    console.log(`Existing events to mark major: ${toUpdate.length}`);
+  if (nullMajor && nullMajor.length > 0) {
+    const toUpdate = nullMajor
+      .filter(e => MAJOR_TERMS.some(t => (e.name || '').toLowerCase().includes(t)))
+      .map(e => e.id);
+
+    console.log(`Marking ${toUpdate.length} existing events as major`);
     for (let i = 0; i < toUpdate.length; i += 100) {
       await supabase.from('events').update({ is_major: true }).in('id', toUpdate.slice(i, i + 100));
     }
-    console.log('Backfill done');
   }
 
+  console.log('Done.');
   process.exit(0);
 }
 

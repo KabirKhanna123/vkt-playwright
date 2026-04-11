@@ -3,4 +3,4 @@ builder = "dockerfile"
 
 [deploy]
 restartPolicyType = "on_failure"
-startCommand = "node targeted-seeder.js"
+startCommand = "find /app -name 'targeted-seeder.js' 2>/dev/null && ls /app"
